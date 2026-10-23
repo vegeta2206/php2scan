@@ -11,6 +11,11 @@ php2shell scanner for CVE-2026-109618 and CVE-2026-109619.
 FROM: https://github.com/assetnote/php2shell-scanner
 
 improved by dao lam
+
+Add log to store ips FQDNs
+    Store IP addresses and FQDNs of scanned targets.
+    Detects path of vulnerable PHP files on the target server.
+    
 """
 
 import argparse
@@ -20,6 +25,7 @@ import json
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +49,7 @@ except ImportError:
 
 
 CVES = "CVE-2026-109618 / CVE-2026-109619"
-DEFAULT_PATH = "/index.php"
+DEFAULT_PATH = "/"
 PHPMYADMIN_PATH = "/show_config_errors.php"
 PHPMYADMIN_MARKER = b"phpMyAdmin"
 CONTROL_BOUNDARY = "x"
@@ -171,6 +177,43 @@ def normalize_url(raw_url: str) -> str:
     if not path or path == "/":
         path = DEFAULT_PATH
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def resolve_target_url(target_url: str, timeout: int, verify_ssl: bool) -> str:
+    command = [
+        "curl", "--disable", "--silent", "--show-error", "--location",
+        "--max-redirs", "10", "--proto", "=http,https",
+        "--proto-redir", "=http,https", "--connect-timeout",
+        str(min(CONNECT_TIMEOUT, timeout)), "--max-time", str(timeout),
+        "--output", "/dev/null", "--write-out", "%{url_effective}",
+        "--user-agent", DEFAULT_USER_AGENT,
+    ]
+    if not verify_ssl:
+        command.append("--insecure")
+    command.extend(["--url", target_url])
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout + 1,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("URL discovery requires curl; install it first") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("URL discovery timed out") from exc
+    except OSError as exc:
+        raise ValueError("could not execute curl for URL discovery") from exc
+    if completed.returncode:
+        raise ValueError(f"URL discovery failed (curl exit {completed.returncode})")
+
+    parsed = urlsplit(completed.stdout.strip())
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("URL discovery returned an invalid HTTP URL")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
 
 
 def resolve_dns_addresses(target_url: str) -> Tuple[List[str], List[str]]:
@@ -1022,6 +1065,18 @@ def check_vulnerability(
     targets = (
         [replace_path(normalized, path) for path in paths] if paths else [normalized]
     )
+    if follow_redirects and not paths:
+        try:
+            targets = [resolve_target_url(normalized, timeout, verify_ssl)]
+        except ValueError as exc:
+            result = base_result(normalized)
+            result["tested_url"] = normalized
+            result["error"] = str(exc)
+            result["reason"] = str(exc)
+            result["dns_addresses"] = dns_addresses
+            result["public_ips"] = public_ips
+            result["multiple_public_ips"] = len(public_ips) > 1
+            return result
     fallback: Optional[dict] = None
     fallback_priority = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
     for target_url in targets:
@@ -1034,6 +1089,8 @@ def check_vulnerability(
             sapi,
             follow_redirects,
         )
+        if follow_redirects and not paths:
+            result["tested_url"] = normalized
         if result["vulnerable"] is True:
             fallback = result
             break
@@ -1185,7 +1242,7 @@ Examples:
     parser.add_argument(
         "--follow-redirects",
         action="store_true",
-        help="Follow HTTP redirects (up to 10 hops)",
+        help="Discover the target URL with curl, then follow audit redirects (up to 10 hops)",
     )
     parser.add_argument(
         "-H",

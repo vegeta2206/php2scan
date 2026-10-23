@@ -1,6 +1,8 @@
 # php2shell-scanner
 # original version is here : https://github.com/assetnote/php2shell-scanner
 
+Modified to determine FQDN using multiple IP addresses hosting
+
 A command-line tool for detecting CVE-2026-109618 and CVE-2026-109619 in PHP applications.
 
 ## How It Works

@@ -6,16 +6,12 @@
 #     "tqdm>=4.64.0",
 # ]
 # ///
-"""
-php2shell scanner for CVE-2026-109618 and CVE-2026-109619.
-FROM: https://github.com/assetnote/php2shell-scanner
+"""External assessment helper for CVE-2026-109618 and CVE-2026-109619.
 
-improved by dao lam
-
-Add log to store ips FQDNs
-    Store IP addresses and FQDNs of scanned targets.
-    Detects path of vulnerable PHP files on the target server.
-    
+Based on Assetnote's php2shell-scanner. Discovery mode sends one small control
+request and records remotely observable version evidence. Active mode sends
+memory-pressure probes and must only be used against explicitly authorised
+targets.
 """
 
 import argparse
@@ -25,7 +21,6 @@ import json
 import re
 import socket
 import ssl
-import subprocess
 import sys
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -74,6 +69,7 @@ DEFAULT_USER_AGENT = (
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
 FIXED_VERSIONS = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
+OLDEST_FIXED_BRANCH = min(FIXED_VERSIONS)
 VERSION_PATTERN = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 SENSITIVE_HEADERS = {
@@ -103,6 +99,7 @@ class HTTPResult:
     body: bytes = b""
     bytes_sent: int = 0
     error: Optional[str] = None
+    final_url: Optional[str] = None
 
     @property
     def powered_by(self) -> str:
@@ -117,8 +114,9 @@ def colorize(text: str, color: str) -> str:
 
 
 def print_banner() -> None:
-    print(f"\n{Colors.CYAN}{Colors.BOLD}brought to you by assetnote{Colors.RESET}")
-    print(f"{Colors.RED}{Colors.BOLD}improved by dao{Colors.RESET}\n")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}php2scan{Colors.RESET}")
+    print("Based on Assetnote's php2shell-scanner; hardened by Dao Lam.\n")
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -177,43 +175,6 @@ def normalize_url(raw_url: str) -> str:
     if not path or path == "/":
         path = DEFAULT_PATH
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-
-
-def resolve_target_url(target_url: str, timeout: int, verify_ssl: bool) -> str:
-    command = [
-        "curl", "--disable", "--silent", "--show-error", "--location",
-        "--max-redirs", "10", "--proto", "=http,https",
-        "--proto-redir", "=http,https", "--connect-timeout",
-        str(min(CONNECT_TIMEOUT, timeout)), "--max-time", str(timeout),
-        "--output", "/dev/null", "--write-out", "%{url_effective}",
-        "--user-agent", DEFAULT_USER_AGENT,
-    ]
-    if not verify_ssl:
-        command.append("--insecure")
-    command.extend(["--url", target_url])
-    try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout + 1,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise ValueError("URL discovery requires curl; install it first") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError("URL discovery timed out") from exc
-    except OSError as exc:
-        raise ValueError("could not execute curl for URL discovery") from exc
-    if completed.returncode:
-        raise ValueError(f"URL discovery failed (curl exit {completed.returncode})")
-
-    parsed = urlsplit(completed.stdout.strip())
-    if (
-        parsed.scheme not in ("http", "https")
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise ValueError("URL discovery returned an invalid HTTP URL")
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
 
 
 def resolve_dns_addresses(target_url: str) -> Tuple[List[str], List[str]]:
@@ -573,6 +534,7 @@ async def exchange_post(
     headers: Dict[str, str],
     timeout: int,
     verify_ssl: bool,
+    connect_ip: Optional[str] = None,
 ) -> HTTPResult:
     parsed = urlsplit(target_url)
     hostname = parsed.hostname
@@ -598,7 +560,7 @@ async def exchange_post(
     transport, base_protocol = await asyncio.wait_for(
         loop.create_connection(
             DuplexHTTPProtocol,
-            host=hostname,
+            host=connect_ip or hostname,
             port=port,
             happy_eyeballs_delay=0.25,
             **open_kwargs,
@@ -640,9 +602,12 @@ async def timed_exchange_post(
     headers: Dict[str, str],
     timeout: int,
     verify_ssl: bool,
+    connect_ip: Optional[str] = None,
 ) -> HTTPResult:
     return await asyncio.wait_for(
-        exchange_post(target_url, body, headers, timeout, verify_ssl),
+        exchange_post(
+            target_url, body, headers, timeout, verify_ssl, connect_ip=connect_ip
+        ),
         timeout=timeout,
     )
 
@@ -655,15 +620,24 @@ def send_post(
     timeout: int,
     verify_ssl: bool,
     follow_redirects: bool = False,
+    connect_ip: Optional[str] = None,
 ) -> HTTPResult:
     headers = request_headers(custom_headers, boundary)
     result = HTTPResult()
     current_url = target_url
+    current_connect_ip = connect_ip
     for redirects in range(11 if follow_redirects else 1):
         result.bytes_sent += len(body)
         try:
             response = asyncio.run(
-                timed_exchange_post(current_url, body, headers, timeout, verify_ssl)
+                timed_exchange_post(
+                    current_url,
+                    body,
+                    headers,
+                    timeout,
+                    verify_ssl,
+                    connect_ip=current_connect_ip,
+                )
             )
         except ssl.SSLError as exc:
             result.error = f"SSL error: {exc}"
@@ -711,7 +685,9 @@ def send_post(
             for name in list(headers):
                 if name.lower() in SENSITIVE_HEADERS or name.lower() == "host":
                     del headers[name]
+            current_connect_ip = None
         current_url = next_url
+    result.final_url = current_url
     return result
 
 
@@ -722,6 +698,10 @@ def version_verdict(powered_by: str) -> Optional[str]:
     major, minor, patch = (int(value) for value in match.groups())
     fixed_patch = FIXED_VERSIONS.get((major, minor))
     if fixed_patch is None:
+        # PHP branches older than 8.2 have no fixed upstream release. A vendor
+        # may still ship a backport, which cannot be established over HTTP.
+        if (major, minor) < OLDEST_FIXED_BRANCH:
+            return "LEGACY"
         return None
     return "FIXED" if patch >= fixed_patch else "VULNERABLE"
 
@@ -790,7 +770,9 @@ def describe_response(response: HTTPResult) -> str:
     )
 
 
-def response_dump(response: HTTPResult) -> Optional[str]:
+def response_dump(
+    response: HTTPResult, include_response_body: bool = False
+) -> Optional[str]:
     if response.status_code is None:
         return None
     lines = [f"HTTP/1.1 {response.status_code} {response.reason}".rstrip()]
@@ -798,8 +780,11 @@ def response_dump(response: HTTPResult) -> Optional[str]:
         f"{name}: {redact_header(name, value)}"
         for name, value in response.headers.items()
     )
-    excerpt = response.body[:EXCERPT_LIMIT].decode("utf-8", errors="replace")
-    return "\r\n".join(lines) + "\r\n\r\n" + excerpt
+    if include_response_body:
+        body = response.body[:EXCERPT_LIMIT].decode("utf-8", errors="replace")
+    else:
+        body = f"<response body omitted; {len(response.body)} bytes>"
+    return "\r\n".join(lines) + "\r\n\r\n" + body
 
 
 def request_dump(
@@ -839,6 +824,12 @@ def base_result(host: str) -> dict:
         "dns_addresses": [],
         "public_ips": [],
         "multiple_public_ips": False,
+        "multiple_addresses": False,
+        "connect_ip": None,
+        "active": False,
+        "confidence": None,
+        "needs_verification": True,
+        "endpoint_results": [],
         "vulnerable": None,
         "verdict": "ERROR",
         "status_code": None,
@@ -856,9 +847,11 @@ def base_result(host: str) -> dict:
     }
 
 
-def apply_response(result: dict, response: HTTPResult) -> None:
+def apply_response(
+    result: dict, response: HTTPResult, include_response_body: bool = False
+) -> None:
     result["status_code"] = response.status_code
-    result["response"] = response_dump(response)
+    result["response"] = response_dump(response, include_response_body)
 
 
 def response_metadata(response: HTTPResult) -> dict:
@@ -867,6 +860,7 @@ def response_metadata(response: HTTPResult) -> dict:
         "response_bytes": len(response.body),
         "bytes_sent": response.bytes_sent,
         "error": response.error,
+        "final_url": response.final_url,
         "description": describe_response(response),
     }
 
@@ -879,10 +873,15 @@ def check_url(
     custom_headers: Dict[str, str],
     sapi: str,
     follow_redirects: bool = False,
+    active: bool = False,
+    connect_ip: Optional[str] = None,
+    include_response_body: bool = False,
 ) -> dict:
     result = base_result(host)
     result["tested_url"] = target_url
     result["final_url"] = target_url
+    result["active"] = active
+    result["connect_ip"] = connect_ip
 
     control_headers = request_headers(custom_headers, CONTROL_BOUNDARY)
     control = send_post(
@@ -893,6 +892,7 @@ def check_url(
         timeout,
         verify_ssl,
         follow_redirects,
+        connect_ip=connect_ip,
     )
     result["request"] = request_dump(
         target_url,
@@ -900,8 +900,19 @@ def check_url(
         len(CONTROL_BODY),
         "minimal multipart control body",
     )
-    apply_response(result, control)
+    apply_response(result, control, include_response_body)
     result["control"] = response_metadata(control)
+    if control.final_url:
+        original = urlsplit(target_url)
+        final = urlsplit(control.final_url)
+        if (original.scheme.lower(), original.netloc.lower()) != (
+            final.scheme.lower(),
+            final.netloc.lower(),
+        ):
+            connect_ip = None
+            result["connect_ip"] = None
+        target_url = control.final_url
+        result["final_url"] = target_url
 
     if control.error:
         result["error"] = f"control request failed: {control.error}"
@@ -924,6 +935,7 @@ def check_url(
             timeout,
             verify_ssl,
             follow_redirects,
+            connect_ip=connect_ip,
         )
         result["request"] = request_dump(
             target_url,
@@ -931,8 +943,11 @@ def check_url(
             len(CONTROL_BODY),
             "minimal multipart control body",
         )
-        apply_response(result, control)
+        apply_response(result, control, include_response_body)
         result["control"] = response_metadata(control)
+        if control.final_url:
+            target_url = control.final_url
+            result["final_url"] = target_url
         if control.error:
             result["error"] = f"phpMyAdmin control request failed: {control.error}"
             result["reason"] = result["error"]
@@ -946,6 +961,42 @@ def check_url(
             return result
 
     powered_by = control.powered_by
+    result["powered_by"] = powered_by or None
+
+    if not active:
+        by_version = version_verdict(powered_by)
+        if by_version == "FIXED":
+            result["vulnerable"] = False
+            result["verdict"] = "PATCHED_VERSION_ADVERTISED"
+            result["confidence"] = "low"
+            result["reason"] = (
+                "discovery check only; X-Powered-By advertises a patched upstream "
+                f"release ({powered_by}); verify the actual runtime and package"
+            )
+        elif by_version == "VULNERABLE":
+            result["verdict"] = "AT_RISK_VERSION"
+            result["confidence"] = "medium"
+            result["reason"] = (
+                "discovery check only; X-Powered-By advertises an upstream version "
+                f"below the fixed release ({powered_by}); ask the supplier to "
+                "confirm any vendor backport"
+            )
+        elif by_version == "LEGACY":
+            result["verdict"] = "LEGACY_VERSION_REVIEW"
+            result["confidence"] = "medium"
+            result["reason"] = (
+                "discovery check only; X-Powered-By advertises an end-of-life PHP "
+                f"branch ({powered_by}); an external test cannot confirm a vendor "
+                "backport"
+            )
+        else:
+            result["verdict"] = "INCONCLUSIVE"
+            result["reason"] = (
+                "discovery check found no usable PHP version header; run an authorised "
+                "active test or request package evidence from the supplier"
+            )
+        return result
+
     rejected = False
     rejected_reason = None
 
@@ -960,6 +1011,7 @@ def check_url(
             timeout,
             verify_ssl,
             follow_redirects,
+            connect_ip=connect_ip,
         )
         probe_metadata = response_metadata(probe)
         probe_metadata.update({"probe": index, "size_mib": size_mib, "parts": parts})
@@ -971,7 +1023,7 @@ def check_url(
             f"php2shell probe {index}: {size_mib} MiB, {parts} parts, "
             f"{NESTED_KEYS} nested keys",
         )
-        apply_response(result, probe)
+        apply_response(result, probe, include_response_body)
 
         if probe.powered_by:
             powered_by = probe.powered_by
@@ -995,51 +1047,103 @@ def check_url(
 
         detected_sapi, signal = crash_signal(control, probe, sapi)
         if signal:
-            result["vulnerable"] = True
-            result["verdict"] = "VULNERABLE"
-            result["sapi"] = detected_sapi
-            result["reason"] = (
-                f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
-                f"request handler: {signal}"
+            confirmation = send_post(
+                target_url,
+                CONTROL_BODY,
+                CONTROL_BOUNDARY,
+                custom_headers,
+                timeout,
+                verify_ssl,
+                follow_redirects,
+                connect_ip=connect_ip,
             )
+            result["post_signal_control"] = response_metadata(confirmation)
+            by_version = version_verdict(powered_by)
+            result["sapi"] = detected_sapi
+            confirmation_ok = (
+                confirmation.error is None
+                and confirmation.status_code is not None
+                and confirmation.status_code < 500
+            )
+            if not confirmation_ok:
+                result["verdict"] = "SUSPICIOUS_SIGNAL"
+                result["confidence"] = "low"
+                result["reason"] = (
+                    f"probe {index} ({size_mib} MiB, {parts} parts) produced a "
+                    f"crash-like signal ({signal}), but the follow-up control "
+                    "request did not confirm service recovery; investigate a wider "
+                    "outage, proxy failure, or rate limit before attributing it to PHP"
+                )
+            elif by_version == "FIXED":
+                result["verdict"] = "SUSPICIOUS_SIGNAL"
+                result["confidence"] = "low"
+                result["reason"] = (
+                    f"probe {index} ({size_mib} MiB, {parts} parts) produced a "
+                    f"crash-like signal ({signal}), but {powered_by} advertises a "
+                    "patched release; treat this as a possible resource-limit or "
+                    "proxy false positive and correlate server logs"
+                )
+            else:
+                result["vulnerable"] = True
+                result["verdict"] = "LIKELY_VULNERABLE"
+                result["confidence"] = (
+                    "high" if by_version in ("VULNERABLE", "LEGACY") else "medium"
+                )
+                result["reason"] = (
+                    f"probe {index} ({size_mib} MiB, {parts} parts) produced a "
+                    f"crash-like request-handler signal and the control request "
+                    f"recovered afterwards: {signal}; supplier-side runtime and logs "
+                    "must confirm the finding"
+                )
             return result
 
         if version_verdict(powered_by) == "FIXED":
             result["vulnerable"] = False
-            result["verdict"] = "FIXED"
+            result["verdict"] = "PATCHED_VERSION_ADVERTISED"
+            result["confidence"] = "medium"
             result["reason"] = (
-                "no crash observed and X-Powered-By reports a patched release: "
-                + powered_by
+                "no crash-like signal observed and X-Powered-By advertises a "
+                f"patched upstream release ({powered_by}); verify the actual runtime"
             )
             return result
 
     by_version = version_verdict(powered_by)
     result["powered_by"] = powered_by or None
     if by_version == "VULNERABLE":
-        result["vulnerable"] = True
-        result["verdict"] = "VULNERABLE"
+        result["verdict"] = "AT_RISK_VERSION"
+        result["confidence"] = "medium"
         result["sapi"] = (
             "unknown" if sapi == "auto" else "PHP-FPM" if sapi == "fpm" else "mod_php"
         )
         result["reason"] = (
-            "no crash observed; X-Powered-By reports an unpatched release: "
-            + powered_by
+            "no crash-like signal observed, but X-Powered-By advertises an upstream "
+            f"version below the fixed release ({powered_by}); verify vendor backports"
+        )
+    elif by_version == "LEGACY":
+        result["verdict"] = "LEGACY_VERSION_REVIEW"
+        result["confidence"] = "medium"
+        result["reason"] = (
+            "no crash-like signal observed, but X-Powered-By advertises an end-of-life "
+            f"PHP branch ({powered_by}); verify a vendor backport"
         )
     elif by_version == "FIXED":
         result["vulnerable"] = False
-        result["verdict"] = "FIXED"
+        result["verdict"] = "PATCHED_VERSION_ADVERTISED"
+        result["confidence"] = "medium"
         result["reason"] = (
-            "no crash observed and X-Powered-By reports a patched release: "
-            + powered_by
+            "no crash-like signal observed and X-Powered-By advertises a patched "
+            f"upstream release ({powered_by}); verify the actual runtime"
         )
     elif rejected:
         result["verdict"] = "INCONCLUSIVE"
         result["error"] = rejected_reason
         result["reason"] = rejected_reason
     else:
-        result["vulnerable"] = False
-        result["verdict"] = "NO SIGNAL"
-        result["reason"] = "no crash observed and no PHP version advertised"
+        result["verdict"] = "INCONCLUSIVE"
+        result["reason"] = (
+            "no crash-like signal observed and no usable PHP version was advertised; "
+            "absence of a signal is not proof that the target is patched"
+        )
     return result
 
 
@@ -1051,6 +1155,9 @@ def check_vulnerability(
     sapi: str = "auto",
     paths: Optional[List[str]] = None,
     follow_redirects: bool = False,
+    active: bool = False,
+    scan_each_ip: bool = False,
+    include_response_body: bool = False,
 ) -> dict:
     display_host = safe_url_label(host)
     try:
@@ -1065,43 +1172,67 @@ def check_vulnerability(
     targets = (
         [replace_path(normalized, path) for path in paths] if paths else [normalized]
     )
-    if follow_redirects and not paths:
-        try:
-            targets = [resolve_target_url(normalized, timeout, verify_ssl)]
-        except ValueError as exc:
-            result = base_result(normalized)
-            result["tested_url"] = normalized
-            result["error"] = str(exc)
-            result["reason"] = str(exc)
-            result["dns_addresses"] = dns_addresses
-            result["public_ips"] = public_ips
-            result["multiple_public_ips"] = len(public_ips) > 1
-            return result
+    if scan_each_ip and not dns_addresses:
+        result = base_result(normalized)
+        result["verdict"] = "ERROR"
+        result["error"] = "DNS resolution returned no address to test"
+        result["reason"] = result["error"]
+        result["dns_addresses"] = dns_addresses
+        result["public_ips"] = public_ips
+        return result
+
+    connect_ips: List[Optional[str]] = (
+        list(dns_addresses) if scan_each_ip else [None]
+    )
+    endpoint_results: List[dict] = []
     fallback: Optional[dict] = None
-    fallback_priority = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
-    for target_url in targets:
-        result = check_url(
-            normalized,
-            target_url,
-            timeout,
-            verify_ssl,
-            custom_headers or {},
-            sapi,
-            follow_redirects,
-        )
-        if follow_redirects and not paths:
-            result["tested_url"] = normalized
-        if result["vulnerable"] is True:
-            fallback = result
-            break
-        if fallback is None or fallback_priority.get(
-            result["verdict"], 0
-        ) > fallback_priority.get(fallback["verdict"], 0):
-            fallback = result
+    fallback_priority = {
+        "PATCHED_VERSION_ADVERTISED": 1,
+        "INCONCLUSIVE": 2,
+        "PARTIAL_MULTI_IP_COVERAGE": 3,
+        "ERROR": 3,
+        "SUSPICIOUS_SIGNAL": 4,
+        "AT_RISK_VERSION": 4,
+        "LEGACY_VERSION_REVIEW": 4,
+        "LIKELY_VULNERABLE": 5,
+    }
+    for connect_ip in connect_ips:
+        for target_url in targets:
+            endpoint = check_url(
+                normalized,
+                target_url,
+                timeout,
+                verify_ssl,
+                custom_headers or {},
+                sapi,
+                follow_redirects,
+                active=active,
+                connect_ip=connect_ip,
+                include_response_body=include_response_body,
+            )
+            endpoint_results.append(endpoint)
+            if fallback is None or fallback_priority.get(
+                endpoint["verdict"], 0
+            ) > fallback_priority.get(fallback["verdict"], 0):
+                fallback = endpoint
+
     result = fallback or base_result(normalized)
+    result["endpoint_results"] = [
+        {key: value for key, value in endpoint.items() if key != "endpoint_results"}
+        for endpoint in endpoint_results
+    ]
     result["dns_addresses"] = dns_addresses
     result["public_ips"] = public_ips
     result["multiple_public_ips"] = len(public_ips) > 1
+    result["multiple_addresses"] = len(dns_addresses) > 1
+    if len(dns_addresses) > 1 and not scan_each_ip and result["vulnerable"] is False:
+        result["vulnerable"] = None
+        result["verdict"] = "PARTIAL_MULTI_IP_COVERAGE"
+        result["confidence"] = "low"
+        result["reason"] = (
+            "the hostname resolves to multiple addresses but only the resolver-selected "
+            "node was tested; rerun with --scan-each-ip before treating it as patched"
+        )
     return result
 
 
@@ -1141,7 +1272,7 @@ def deduplicate_hosts(hosts: List[str]) -> List[str]:
 def save_results(
     results: List[dict],
     output_file: str,
-    vulnerable_only: bool = True,
+    vulnerable_only: bool = False,
     announce: bool = True,
 ) -> bool:
     selected = (
@@ -1169,10 +1300,16 @@ def print_result(result: dict, verbose: bool = False) -> None:
     host = result["host"]
     verdict = result["verdict"]
     if result["vulnerable"] is True:
-        status = colorize("[VULNERABLE]", Colors.RED + Colors.BOLD)
-    elif result["vulnerable"] is False:
-        status = colorize("[NOT VULNERABLE]", Colors.GREEN)
-    elif verdict == "INCONCLUSIVE":
+        status = colorize("[LIKELY VULNERABLE]", Colors.RED + Colors.BOLD)
+    elif verdict == "PATCHED_VERSION_ADVERTISED":
+        status = colorize("[PATCHED VERSION ADVERTISED]", Colors.GREEN)
+    elif verdict in {
+        "AT_RISK_VERSION",
+        "LEGACY_VERSION_REVIEW",
+        "SUSPICIOUS_SIGNAL",
+    }:
+        status = colorize("[REVIEW REQUIRED]", Colors.YELLOW + Colors.BOLD)
+    elif verdict in {"INCONCLUSIVE", "PARTIAL_MULTI_IP_COVERAGE"}:
         status = colorize("[INCONCLUSIVE]", Colors.YELLOW)
     else:
         status = colorize("[ERROR]", Colors.YELLOW)
@@ -1187,9 +1324,11 @@ def print_result(result: dict, verbose: bool = False) -> None:
     suffix = " - " + " - ".join(details) if details else ""
     print(f"{status} {colorize(terminal_safe(host), Colors.WHITE)}{suffix}")
 
-    if result.get("multiple_public_ips"):
-        public_ips = ", ".join(result["public_ips"])
-        print(f"  -> DNS resolved to multiple public IPs: {public_ips}")
+    if result.get("multiple_addresses"):
+        addresses = ", ".join(result["dns_addresses"])
+        print(f"  -> DNS resolved to multiple addresses: {addresses}")
+    if result.get("connect_ip"):
+        print(f"  -> Connected directly to: {result['connect_ip']}")
     if result.get("final_url") and result.get("final_url") != result.get("tested_url"):
         print(f"  -> Retargeted to: {terminal_safe(result['final_url'])}")
     if verbose and result.get("reason"):
@@ -1198,6 +1337,14 @@ def print_result(result: dict, verbose: bool = False) -> None:
         print(colorize("  Response snippet:", Colors.CYAN))
         for line in result["response"].split("\r\n")[:10]:
             print(f"    {terminal_safe(line)}")
+    if verbose and len(result.get("endpoint_results", [])) > 1:
+        print(colorize("  Endpoint results:", Colors.CYAN))
+        for endpoint in result["endpoint_results"]:
+            endpoint_label = endpoint.get("connect_ip") or "system DNS"
+            print(
+                f"    {endpoint_label} {endpoint.get('tested_url')}: "
+                f"{endpoint.get('verdict')}"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1207,10 +1354,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   %(prog)s -u https://example.com
-  %(prog)s -l hosts.txt -t 20 -o results.json
-  %(prog)s -u https://example.com -H "Authorization: Bearer token"
-  %(prog)s -u https://example.com --path /phpinfo.php
-  %(prog)s -l hosts.txt --sapi fpm --timeout 90
+  %(prog)s -u https://example.com --active --scan-each-ip
+  %(prog)s -l hosts.txt --active -t 2 -o results.json
+  %(prog)s -u https://example.com --path /index.php
         """,
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -1219,7 +1365,7 @@ Examples:
         "-l", "--list", help="File containing hosts (one per line)"
     )
     parser.add_argument(
-        "-t", "--threads", type=int, default=10, help="Concurrent threads (default: 10)"
+        "-t", "--threads", type=int, default=1, help="Concurrent threads (default: 1)"
     )
     parser.add_argument(
         "--timeout",
@@ -1231,7 +1377,27 @@ Examples:
     parser.add_argument(
         "--all-results",
         action="store_true",
-        help="Save all results, not only vulnerable hosts",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--vulnerable-only",
+        action="store_true",
+        help="Save only likely-vulnerable results (default: save the full audit trail)",
+    )
+    parser.add_argument(
+        "--active",
+        action="store_true",
+        help="Send memory-pressure probes; authorised targets only",
+    )
+    parser.add_argument(
+        "--scan-each-ip",
+        action="store_true",
+        help="Test every resolved A/AAAA address while preserving HTTP Host and TLS SNI",
+    )
+    parser.add_argument(
+        "--include-response-body",
+        action="store_true",
+        help="Include up to 2 KiB of response bodies in output (may expose sensitive data)",
     )
     parser.add_argument(
         "-k",
@@ -1242,7 +1408,7 @@ Examples:
     parser.add_argument(
         "--follow-redirects",
         action="store_true",
-        help="Discover the target URL with curl, then follow audit redirects (up to 10 hops)",
+        help="Follow HTTP redirects during assessment (up to 10 hops)",
     )
     parser.add_argument(
         "-H",
@@ -1259,7 +1425,7 @@ Examples:
         help="Show verdict reasons and response snippets",
     )
     parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Only print vulnerable hosts"
+        "-q", "--quiet", action="store_true", help="Only print results requiring attention"
     )
     parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
@@ -1325,6 +1491,16 @@ def main() -> None:
         print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
         print(colorize(f"[*] Timeout: {args.timeout}s", Colors.CYAN))
         print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
+        print(
+            colorize(
+                "[*] Mode: active memory-pressure probes"
+                if args.active
+                else "[*] Mode: low-impact discovery request only",
+                Colors.YELLOW if args.active else Colors.CYAN,
+            )
+        )
+        if args.scan_each_ip:
+            print(colorize("[*] Testing every resolved IP address", Colors.CYAN))
         if args.insecure:
             print(colorize("[!] TLS verification disabled", Colors.YELLOW))
         print()
@@ -1344,6 +1520,9 @@ def main() -> None:
                 sapi=args.sapi,
                 paths=paths,
                 follow_redirects=args.follow_redirects,
+                active=args.active,
+                scan_each_ip=args.scan_each_ip,
+                include_response_body=args.include_response_body,
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
@@ -1351,14 +1530,14 @@ def main() -> None:
             result["reason"] = result["error"]
             return result
 
-    if len(hosts) > 1:
+    if args.active and len(hosts) > 1:
         for probe in PROBES:
             build_probe_body(*probe)
 
     if len(hosts) == 1:
         result = scan(hosts[0])
         results.append(result)
-        if not args.quiet or result["vulnerable"] is True:
+        if not args.quiet or result["vulnerable"] is not False:
             print_result(result, args.verbose)
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
@@ -1374,7 +1553,7 @@ def main() -> None:
                     result = future.result()
                     results.append(result)
 
-                    should_print = result["vulnerable"] is True or (
+                    should_print = result["vulnerable"] is not False or (
                         not args.quiet
                         and (args.verbose or result["multiple_public_ips"])
                     )
@@ -1387,19 +1566,20 @@ def main() -> None:
                     progress.update(1)
 
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
-    error_count = sum(result["vulnerable"] is None for result in results)
+    attention_count = sum(result["vulnerable"] is None for result in results)
+    patched_count = sum(result["vulnerable"] is False for result in results)
     if not args.quiet:
         print()
         print(colorize("=" * 60, Colors.CYAN))
         print(colorize("SCAN SUMMARY", Colors.BOLD))
         print(colorize("=" * 60, Colors.CYAN))
         print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Vulnerable: {vulnerable_count}"
+        vulnerable_label = f"Likely vulnerable: {vulnerable_count}"
         if vulnerable_count:
             vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
         print(f"  {vulnerable_label}")
-        print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
-        print(f"  Inconclusive/errors: {error_count}")
+        print(f"  Patched version advertised: {patched_count}")
+        print(f"  Review/inconclusive/errors: {attention_count}")
         print(colorize("=" * 60, Colors.CYAN))
 
     output_saved = True
@@ -1407,12 +1587,16 @@ def main() -> None:
         output_saved = save_results(
             results,
             args.output,
-            vulnerable_only=not args.all_results,
+            vulnerable_only=args.vulnerable_only and not args.all_results,
             announce=not args.quiet,
         )
     if not output_saved:
         raise SystemExit(2)
-    raise SystemExit(1 if vulnerable_count else 0)
+    if vulnerable_count:
+        raise SystemExit(1)
+    if attention_count:
+        raise SystemExit(2)
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":

@@ -1,132 +1,146 @@
-# php2shell-scanner
-# original version is here : https://github.com/assetnote/php2shell-scanner
+# php2scan
 
-Modified to determine FQDN using multiple IP addresses hosting
+External assessment helper for CVE-2026-109618 and CVE-2026-109619.
 
-A command-line tool for detecting CVE-2026-109618 and CVE-2026-109619 in PHP applications.
+This project is based on
+[Assetnote's php2shell-scanner](https://github.com/assetnote/php2shell-scanner)
+and retains its MIT licence. This version adds conservative verdicts, discovery
+and active modes, per-IP testing for multi-address hostnames, safer evidence
+storage, and automated tests.
 
-## How It Works
+## Important safety notice
 
-The scanner sends a minimal multipart control request followed by up to three crafted multipart probes. The probes use PHP array keys nested 62 levels deep and increase from 1 MiB to 20 MiB, matching the detection logic used by Assetnote's internal scanner.
+Active mode is **not a passive vulnerability scan**. It sends crafted multipart
+requests designed to create memory pressure in PHP. One path can receive up to
+three probes totalling roughly 29 MiB. The probes can trigger HTTP 500 errors,
+worker restarts, resource alerts, or service degradation.
 
-A target is reported vulnerable when the probe produces a PHP memory-exhaustion error, a differential empty HTTP 500, a PHP-FPM worker failure, or an advertised PHP version known to be unpatched. Initial 5xx responses, common request-rejection statuses, and nonempty HTTP 500 responses without the PHP fatal-error signature are not treated as crash signals.
+Only use `--active` against explicitly authorised targets, preferably during a
+maintenance window. Start with one thread, monitor the service, and retain the
+supplier's PHP and web-server logs.
 
-The scanner tests `/index.php` by default. A path supplied in the URL is preserved, and `--path` or `--path-file` can test custom paths. phpMyAdmin targets are automatically retested at `/show_config_errors.php`. Redirects are not followed unless `--follow-redirects` is set.
+## Verdicts
 
-### SAPI Modes
+| Verdict | Meaning |
+| --- | --- |
+| `LIKELY_VULNERABLE` | Active crash-like signal observed; supplier-side logs and runtime must confirm it. |
+| `SUSPICIOUS_SIGNAL` | Crash-like signal conflicts with an advertised patched version; possible resource-limit or proxy false positive. |
+| `AT_RISK_VERSION` | HTTP advertises a supported PHP branch below the upstream fixed release; vendor backports remain possible. |
+| `LEGACY_VERSION_REVIEW` | HTTP advertises an end-of-life PHP branch; request vendor backport evidence. |
+| `PATCHED_VERSION_ADVERTISED` | HTTP advertises a fixed upstream version; this is evidence, not proof of the actual runtime. |
+| `PARTIAL_MULTI_IP_COVERAGE` | A multi-address hostname was not tested on every resolved node. |
+| `INCONCLUSIVE` | No reliable external conclusion can be drawn. |
+| `ERROR` | The assessment could not be completed. |
 
-The default `--sapi auto` mode applies both mod_php and PHP-FPM verdict rules, matching the combined behavior of Assetnote's postmodules. Use `--sapi mod_php` or `--sapi fpm` to restrict detection to a known SAPI.
-
-### Network Impact
-
-Each tested path may receive a 42-byte control request and three probes totalling about 29 MiB. Probing stops as soon as the verdict is settled, and duplicate input URLs are scanned once.
+Absence of a crash-like signal is never reported as "not vulnerable".
 
 ## Requirements
 
 - Python 3.9+
-- h11
-- tqdm
+- `h11`
+- `tqdm`
 
-## Installation
-
-```
-pip install -r requirements.txt
-```
-
-### Docker
-
-Build the image:
-
-```
-docker build -t php2shell-scanner .
-```
-
-Run it with the same options as `scanner.py`:
-
-```
-docker run --rm php2shell-scanner -u https://example.com
-```
-
-Mount the current directory to read host lists and write results:
-
-```
-docker run --rm -v "$PWD:/data" -w /data php2shell-scanner -l hosts.txt -o results.json
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
 ## Usage
 
-Scan a single host:
+Low-impact discovery (one small multipart POST; it is not a purely passive
+network observation):
 
-```
+```bash
 python3 scanner.py -u https://example.com
 ```
 
-Scan a list of hosts:
+Authorised active assessment of one hostname:
 
-```
-python3 scanner.py -l hosts.txt
-```
-
-Scan with multiple threads and save results:
-
-```
-python3 scanner.py -l hosts.txt -t 20 -o results.json
+```bash
+python3 scanner.py -u https://example.com --active -o result.json
 ```
 
-Scan with custom headers:
+Test every resolved A/AAAA address while preserving the FQDN in the HTTP Host
+header and TLS SNI:
 
-```
-python3 scanner.py -u https://example.com -H "Authorization: Bearer token" -H "Cookie: session=abc"
-```
-
-Scan a custom path:
-
-```
-python3 scanner.py -u https://example.com --path /phpinfo.php
-python3 scanner.py -u https://example.com --path /index.php --path /admin.php
-python3 scanner.py -u https://example.com --path-file paths.txt
+```bash
+python3 scanner.py -u https://example.com --active --scan-each-ip -o result.json
 ```
 
-Use only PHP-FPM verdict rules:
+Test selected PHP paths:
 
-```
-python3 scanner.py -u https://example.com --sapi fpm
-```
-
-## Options
-
-```
--u, --url         Single URL to check
--l, --list        File containing hosts (one per line)
--t, --threads     Number of concurrent threads (default: 10)
---timeout         Request timeout in seconds (default: 60)
--o, --output      Output file for results (JSON)
---all-results     Save all results, not just vulnerable hosts
--k, --insecure    Disable TLS certificate verification
---follow-redirects Follow HTTP redirects (up to 10 hops)
--H, --header      Custom header (can be used multiple times)
--v, --verbose     Show verdict reasons and response snippets
--q, --quiet       Only output vulnerable hosts
---no-color        Disable colored output
---sapi            Verdict rules: auto, mod_php, or fpm (default: auto)
---path            Custom path to test (can be used multiple times)
---path-file       File containing paths to test (one per line)
+```bash
+python3 scanner.py -u https://example.com --active \
+  --path /index.php --path /admin/index.php
 ```
 
-## Credits
+Multiple hosts, with deliberately limited concurrency:
 
-The first, original discovery of php2shell is attributed to the Calif team. You can read their write up here: [https://calif.io/php2shell/](https://calif.io/php2shell/).
+```bash
+python3 scanner.py -l hosts.txt --active --scan-each-ip \
+  --threads 2 --output results.json
+```
 
-The scanner was built by the Assetnote Security Research Team using logic built for [Searchlight's Exposure Platform](https://www.slcyber.io/exposure).
+Response bodies are omitted from stored evidence by default. If they are
+required for an authorised investigation, enable them explicitly:
 
-## Output
+```bash
+python3 scanner.py -u https://example.com --active --include-response-body
+```
 
-Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence.
+Bodies can contain sensitive application data. Authentication headers are
+redacted in reports, but passing secrets on a command line can still expose
+them through shell history or the process list.
 
-## Limitations
+## Exit codes
 
-On specific PHP configurations, the scanner may report a false positive when its multipart probe exceeds PHP's `memory_limit`. Patched and vulnerable versions can then return the same empty HTTP 500 response.
+- `0`: every result advertised a patched upstream version
+- `1`: at least one active `LIKELY_VULNERABLE` result
+- `2`: review required, inconclusive/error result, or output-write failure
 
-This was reproduced on patched PHP 8.4.27 with `memory_limit` values from **2M to 32M**, and on PHP 8.3.36 at **128M** when `max_multipart_body_parts` is set to **2785 or higher**. The exact threshold may vary between builds.
+## Multi-IP behaviour
 
-When PHP does not disclose its version, the scanner cannot distinguish this safe post-patch OOM from the vulnerable pre-patch behavior. Results should therefore be verified against the installed PHP version and any vendor backports
+Normal DNS resolution may select only one backend. If a hostname has multiple
+addresses and `--scan-each-ip` is not used, php2scan refuses to clear the whole
+hostname and returns `PARTIAL_MULTI_IP_COVERAGE`.
+
+`--scan-each-ip` connects directly to every resolved address while retaining
+the original FQDN for virtual hosting and TLS certificate validation. It does
+not discover unknown FQDNs hosted on an IP address.
+
+## Interpreting external findings
+
+External evidence should be combined with information from the hosting
+supplier:
+
+1. the PHP runtime actually serving the tested URL;
+2. the package version and vendor security revision;
+3. whether the vendor applied a backport;
+4. the SAPI in use (`mod_php`, PHP-FPM, CGI, etc.);
+5. web-server and PHP logs at the probe timestamp;
+6. worker restart or crash evidence.
+
+The upstream fixed releases are PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12.
+Version strings alone cannot identify distribution or vendor backports.
+
+## Docker
+
+```bash
+docker build -t php2scan .
+docker run --rm php2scan -u https://example.com
+docker run --rm php2scan -u https://example.com --active
+```
+
+To read input files and write JSON results:
+
+```bash
+docker run --rm -v "$PWD:/data" -w /data php2scan \
+  -l hosts.txt --active --scan-each-ip -o results.json
+```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```

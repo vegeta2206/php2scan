@@ -6,12 +6,12 @@
 #     "tqdm>=4.64.0",
 # ]
 # ///
-"""External assessment helper for CVE-2026-109618 and CVE-2026-109619.
+"""Assistant d'évaluation externe pour CVE-2026-109618 et CVE-2026-109619.
 
-Based on Assetnote's php2shell-scanner. Discovery mode sends one small control
-request and records remotely observable version evidence. Active mode sends
-memory-pressure probes and must only be used against explicitly authorised
-targets.
+Basé sur php2shell-scanner d'Assetnote. Le mode découverte envoie une petite
+requête de contrôle et consigne les indices de version observables. Le mode
+actif envoie des sondes de pression mémoire et ne doit viser que des cibles
+explicitement autorisées.
 """
 
 import argparse
@@ -33,17 +33,18 @@ from urllib.parse import SplitResult, quote, urljoin, urlsplit, urlunsplit
 try:
     import h11
 except ImportError:
-    print("Error: 'h11' library required. Install with: pip install h11")
+    print("Erreur : bibliothèque 'h11' requise. Installation : pip install h11")
     sys.exit(1)
 
 try:
     from tqdm import tqdm
 except ImportError:
-    print("Error: 'tqdm' library required. Install with: pip install tqdm")
+    print("Erreur : bibliothèque 'tqdm' requise. Installation : pip install tqdm")
     sys.exit(1)
 
 
 CVES = "CVE-2026-109618 / CVE-2026-109619"
+REPORT_SCHEMA_VERSION = 2
 DEFAULT_PATH = "/"
 PHPMYADMIN_PATH = "/show_config_errors.php"
 PHPMYADMIN_MARKER = b"phpMyAdmin"
@@ -82,78 +83,87 @@ SENSITIVE_HEADERS = {
 
 VERDICT_GUIDANCE = {
     "LIKELY_VULNERABLE": (
-        "Treat as a priority supplier incident: confirm the effective PHP package, "
-        "SAPI and logs, then update or apply the vendor backport."
+        "Traitez ce résultat comme un incident fournisseur prioritaire : confirmez "
+        "le paquet PHP réellement chargé, la SAPI et les journaux, puis mettez à "
+        "jour ou appliquez le rétroportage de sécurité du fournisseur."
     ),
     "SUSPICIOUS_SIGNAL": (
-        "Correlate the timestamp with PHP, proxy, WAF and worker logs before "
-        "attributing the signal to PHP2Shell."
+        "Corrélez l'horodatage avec les journaux PHP, proxy, WAF et workers avant "
+        "d'attribuer le signal à PHP2Shell."
     ),
     "AT_RISK_VERSION": (
-        "Request vendor backport evidence or update to a fixed upstream release."
+        "Demandez la preuve du rétroportage fournisseur ou passez à une version "
+        "amont corrigée."
     ),
     "LEGACY_VERSION_REVIEW": (
-        "Upgrade the end-of-life PHP branch or obtain explicit LTS/vendor patch evidence."
+        "Mettez à niveau la branche PHP en fin de vie ou obtenez une preuve "
+        "explicite du correctif LTS/fournisseur."
     ),
     "PATCHED_VERSION_ADVERTISED": (
-        "Verify the package used by the real web pool and every backend; an HTTP "
-        "version header is supporting evidence, not proof."
+        "Vérifiez le paquet utilisé par le pool web réel et chaque backend ; un "
+        "en-tête HTTP de version constitue un indice, pas une preuve."
     ),
     "PARTIAL_MULTI_IP_COVERAGE": (
-        "Rerun with --scan-each-ip and retain every endpoint result."
+        "Relancez avec --scan-each-ip et conservez le résultat de chaque adresse."
     ),
     "REDIRECT_OUT_OF_SCOPE": (
-        "Add the destination hostname as a separate authorised target; php2scan will "
-        "not send probes across hostname boundaries."
+        "Ajoutez le nom d'hôte de destination comme cible autorisée distincte ; "
+        "php2scan n'envoie aucune sonde au-delà du nom d'hôte initial."
     ),
     "REDIRECT_DURING_PROBE": (
-        "Assess the reported final path explicitly after confirming it remains in scope."
+        "Testez explicitement le chemin final indiqué après avoir confirmé qu'il "
+        "reste dans le périmètre autorisé."
     ),
     "INCONCLUSIVE": (
-        "Collect supplier-side runtime, package, SAPI and log evidence; no external "
-        "signal is not proof of remediation."
+        "Collectez auprès du fournisseur le runtime, le paquet, la SAPI et les "
+        "journaux ; l'absence de signal externe ne prouve pas la correction."
     ),
-    "ERROR": "Correct reachability or input errors, then rerun the assessment.",
+    "ERROR": (
+        "Corrigez la cible, la résolution ou l'accessibilité, puis relancez le test."
+    ),
 }
 
 TLS_GUIDANCE = {
     "TLS_VALID": (
-        "Certificate validation succeeded; separately review supported protocols, "
-        "ciphers and certificate lifetime if TLS posture is in scope."
+        "La validation du certificat a réussi ; examinez séparément les protocoles, "
+        "les suites cryptographiques et la durée de vie du certificat."
     ),
     "SELF_SIGNED_CERTIFICATE": (
-        "The test continued without certificate validation. Deploy a certificate "
-        "trusted by the intended clients or distribute the private trust anchor."
+        "Le test a continué sans validation du certificat. Déployez un certificat "
+        "reconnu par les clients ou distribuez l'autorité privée approuvée."
     ),
     "EXPIRED_CERTIFICATE": (
-        "The test continued without certificate validation. Renew and deploy the "
-        "certificate, including the correct intermediate chain."
+        "Le test a continué sans validation du certificat. Renouvelez le certificat "
+        "et déployez la chaîne intermédiaire correcte."
     ),
     "HOSTNAME_MISMATCH": (
-        "The test continued without certificate validation. Deploy a certificate "
-        "whose SAN contains the tested FQDN."
+        "Le test a continué sans validation du certificat. Déployez un certificat "
+        "dont le SAN contient le FQDN testé."
     ),
     "UNTRUSTED_CERTIFICATE": (
-        "The test continued without certificate validation. Repair the trust chain "
-        "or use the organisation's approved private CA."
+        "Le test a continué sans validation du certificat. Réparez la chaîne de "
+        "confiance ou utilisez l'autorité privée approuvée par l'organisation."
     ),
     "TLS_VERIFICATION_DISABLED": (
-        "Rerun without --insecure to record the real certificate validation state."
+        "Relancez sans --insecure afin d'enregistrer l'état réel du certificat."
     ),
     "TLS_HANDSHAKE_FAILED": (
-        "No HTTP assessment was possible. Check TLS protocol/cipher compatibility, "
-        "SNI handling and server logs."
+        "Aucun test HTTP n'a été possible. Vérifiez les protocoles et suites TLS, "
+        "la gestion SNI et les journaux du serveur."
     ),
     "TLS_CONNECTION_FAILED": (
-        "Check HTTPS reachability, listener state, firewall policy and server logs."
+        "Vérifiez l'accessibilité HTTPS, le service en écoute, le pare-feu et les "
+        "journaux du serveur."
     ),
     "HTTPS_TO_HTTP_DOWNGRADE": (
-        "Remove the HTTPS-to-HTTP downgrade and keep the complete request path encrypted."
+        "Supprimez la redirection HTTPS vers HTTP et chiffrez le chemin complet."
     ),
-    "PLAINTEXT_HTTP": "Enable HTTPS and redirect HTTP to HTTPS on the same hostname.",
+    "PLAINTEXT_HTTP": (
+        "Activez HTTPS et redirigez HTTP vers HTTPS sur le même nom d'hôte."
+    ),
     "MIXED": (
-        "TLS state differs across resolved endpoints; remediate each endpoint and "
-        "repeat the complete per-IP assessment."
+        "L'état TLS diffère selon les adresses résolues ; corrigez chaque adresse "
+        "et répétez le test complet par IP."
     ),
 }
 
@@ -194,7 +204,7 @@ def colorize(text: str, color: str) -> str:
 
 def print_banner() -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}php2scan{Colors.RESET}")
-    print("Based on Assetnote's php2shell-scanner; hardened by Dao Lam.\n")
+    print("Basé sur php2shell-scanner d'Assetnote ; renforcé par Dao Lam.\n")
 
 
 def utc_now() -> str:
@@ -205,21 +215,23 @@ def parse_headers(header_list: Optional[List[str]]) -> Dict[str, str]:
     headers: Dict[str, str] = {}
     for header in header_list or []:
         if ":" not in header:
-            raise ValueError(f"invalid header {header!r}; expected 'Key: Value'")
+            raise ValueError(f"en-tête invalide {header!r} ; format attendu 'Nom: Valeur'")
         key, value = header.split(":", 1)
         key = key.strip()
         if not key:
-            raise ValueError(f"invalid header {header!r}; header name is empty")
+            raise ValueError(f"en-tête invalide {header!r} ; nom vide")
         value = value.lstrip()
         if not HEADER_NAME_PATTERN.fullmatch(key):
-            raise ValueError(f"invalid header name {key!r}")
+            raise ValueError(f"nom d'en-tête invalide {key!r}")
         if "\r" in value or "\n" in value:
-            raise ValueError(f"invalid value for header {key!r}")
+            raise ValueError(f"valeur invalide pour l'en-tête {key!r}")
         try:
             key.encode("ascii")
             value.encode("latin-1")
         except UnicodeEncodeError as exc:
-            raise ValueError(f"header {key!r} cannot be encoded as HTTP/1.1") from exc
+            raise ValueError(
+                f"l'en-tête {key!r} ne peut pas être encodé en HTTP/1.1"
+            ) from exc
         headers[key] = value
     return headers
 
@@ -235,25 +247,60 @@ def set_header(headers: Dict[str, str], name: str, value: str) -> None:
     headers[name] = value
 
 
+def url_with_default_scheme(raw_url: str) -> str:
+    """Ajoute HTTPS à une cible sans schéma, y compris une IPv6 littérale."""
+    value = raw_url.strip()
+    if "://" in value:
+        return value
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return "https://" + value
+    if address.version == 6:
+        return f"https://[{value}]"
+    return "https://" + value
+
+
 def normalize_url(raw_url: str) -> str:
     raw_url = raw_url.strip()
     if not raw_url:
-        raise ValueError("invalid or empty URL")
-    if "://" not in raw_url:
-        raw_url = "https://" + raw_url
+        raise ValueError("URL vide ou invalide")
+    if any(character.isspace() for character in raw_url):
+        raise ValueError("la cible contient un caractère d'espacement")
+    raw_url = url_with_default_scheme(raw_url)
 
-    parsed = urlsplit(raw_url)
+    try:
+        parsed = urlsplit(raw_url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"URL HTTP invalide : {exc}") from exc
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("invalid HTTP URL")
+        raise ValueError("URL HTTP invalide")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError(
-            "credentials in URLs are not supported; use an Authorization header"
+            "les identifiants dans l'URL ne sont pas acceptés ; utilisez un en-tête "
+            "Authorization"
         )
+    if parsed.hostname is None:
+        raise ValueError("l'URL ne contient aucun nom d'hôte")
 
     path = parsed.path
     if not path or path == "/":
         path = DEFAULT_PATH
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def target_type(target_url: str) -> str:
+    """Retourne ipv4, ipv6 ou dns pour une URL déjà normalisée."""
+    hostname = urlsplit(target_url).hostname
+    if hostname is None:
+        return "unknown"
+    address_value = hostname.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(address_value)
+    except ValueError:
+        return "dns"
+    return f"ipv{address.version}"
 
 
 def canonical_hostname(target_url: str) -> Optional[str]:
@@ -293,7 +340,7 @@ def safe_url_label(raw_url: str) -> str:
     value = raw_url.strip()
     if not value:
         return "<empty URL>"
-    candidate = value if "://" in value else "https://" + value
+    candidate = url_with_default_scheme(value)
     try:
         parsed = urlsplit(candidate)
     except ValueError:
@@ -924,6 +971,8 @@ def terminal_safe(value: str) -> str:
 def base_result(host: str) -> dict:
     return {
         "host": host,
+        "input_target": host,
+        "target_type": None,
         "dns_addresses": [],
         "public_ips": [],
         "multiple_public_ips": False,
@@ -1063,6 +1112,7 @@ def check_url(
     include_response_body: bool = False,
 ) -> dict:
     result = base_result(host)
+    result["target_type"] = target_type(target_url)
     result["tested_url"] = target_url
     result["final_url"] = target_url
     result["active"] = active
@@ -1377,6 +1427,8 @@ def check_vulnerability(
         normalized = normalize_url(host)
     except ValueError as exc:
         result = base_result(display_host)
+        result["input_target"] = host
+        result["target_type"] = "unknown"
         result["error"] = str(exc)
         result["reason"] = str(exc)
         return attach_guidelines(result)
@@ -1387,6 +1439,8 @@ def check_vulnerability(
     )
     if scan_each_ip and not dns_addresses:
         result = base_result(normalized)
+        result["input_target"] = host
+        result["target_type"] = target_type(normalized)
         result["verdict"] = "ERROR"
         result["error"] = "DNS resolution returned no address to test"
         result["reason"] = result["error"]
@@ -1433,6 +1487,8 @@ def check_vulnerability(
                 fallback = endpoint
 
     result = fallback or base_result(normalized)
+    result["input_target"] = host
+    result["target_type"] = target_type(normalized)
     result["endpoint_results"] = [
         {key: value for key, value in endpoint.items() if key != "endpoint_results"}
         for endpoint in endpoint_results
@@ -1462,13 +1518,18 @@ def check_vulnerability(
 def load_lines(path: str, label: str) -> List[str]:
     values: List[str] = []
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8-sig") as handle:
             for line in handle:
                 value = line.strip()
                 if value and not value.startswith("#"):
                     values.append(value)
     except OSError as exc:
-        print(colorize(f"[ERROR] Failed to read {label} file: {exc}", Colors.RED))
+        print(
+            colorize(
+                f"[ERREUR] Lecture impossible du fichier de {label} : {exc}",
+                Colors.RED,
+            )
+        )
         sys.exit(1)
     return values
 
@@ -1485,11 +1546,70 @@ def deduplicate_hosts(hosts: List[str]) -> List[str]:
                 parsed.path,
             )
         except ValueError:
-            key = (safe_url_label(host),)
+            key = ("invalid", host.strip())
         if key not in seen:
             seen.add(key)
             deduplicated.append(host)
     return deduplicated
+
+
+def increment(counter: Dict[str, int], key: str) -> None:
+    counter[key] = counter.get(key, 0) + 1
+
+
+def build_summary(
+    results: List[dict], input_count: Optional[int] = None
+) -> dict:
+    """Construit une synthèse stable pour la console et le rapport JSON."""
+    verdicts: Dict[str, int] = {}
+    tls_targets: Dict[str, int] = {}
+    tls_endpoints: Dict[str, int] = {}
+    target_types: Dict[str, int] = {}
+    endpoint_count = 0
+
+    for result in results:
+        increment(verdicts, result.get("verdict") or "UNKNOWN")
+        increment(tls_targets, result.get("tls_status") or "UNKNOWN")
+        increment(target_types, result.get("target_type") or "unknown")
+        endpoints = result.get("endpoint_results") or []
+        if endpoints:
+            endpoint_count += len(endpoints)
+            for endpoint in endpoints:
+                increment(tls_endpoints, endpoint.get("tls_status") or "UNKNOWN")
+        elif result.get("tested_url"):
+            endpoint_count += 1
+            increment(tls_endpoints, result.get("tls_status") or "UNKNOWN")
+
+    likely_vulnerable = sum(
+        result.get("vulnerable") is True for result in results
+    )
+    patched = sum(result.get("vulnerable") is False for result in results)
+    review = len(results) - likely_vulnerable - patched
+    return {
+        "input_entries": input_count if input_count is not None else len(results),
+        "unique_targets": len(results),
+        "tested_endpoints": endpoint_count,
+        "duplicate_entries_ignored": max(
+            0, (input_count if input_count is not None else len(results)) - len(results)
+        ),
+        "target_types": dict(sorted(target_types.items())),
+        "outcomes": {
+            "likely_vulnerable": likely_vulnerable,
+            "patched_version_advertised": patched,
+            "review_inconclusive_or_error": review,
+        },
+        "verdicts": dict(sorted(verdicts.items())),
+        "tls_by_target": dict(sorted(tls_targets.items())),
+        "tls_by_endpoint": dict(sorted(tls_endpoints.items())),
+        "coverage": {
+            "multi_address_targets": sum(
+                bool(result.get("multiple_addresses")) for result in results
+            ),
+            "partial_multi_ip_targets": verdicts.get(
+                "PARTIAL_MULTI_IP_COVERAGE", 0
+            ),
+        },
+    }
 
 
 def save_results(
@@ -1497,6 +1617,7 @@ def save_results(
     output_file: str,
     vulnerable_only: bool = False,
     announce: bool = True,
+    summary: Optional[dict] = None,
 ) -> bool:
     selected = (
         [result for result in results if result.get("vulnerable") is True]
@@ -1504,18 +1625,22 @@ def save_results(
         else results
     )
     output = {
+        "schema_version": REPORT_SCHEMA_VERSION,
         "scan_time": utc_now(),
         "total_results": len(selected),
+        "summary": summary or build_summary(results),
         "results": selected,
     }
     try:
         with open(output_file, "w", encoding="utf-8") as handle:
             json.dump(output, handle, indent=2)
         if announce:
-            print(colorize(f"\n[+] Results saved to: {output_file}", Colors.GREEN))
+            message = f"\n[+] Résultats enregistrés dans : {output_file}"
+            print(colorize(message, Colors.GREEN))
         return True
     except OSError as exc:
-        print(colorize(f"\n[ERROR] Failed to save results: {exc}", Colors.RED))
+        message = f"\n[ERREUR] Échec d'écriture des résultats : {exc}"
+        print(colorize(message, Colors.RED))
         return False
 
 
@@ -1523,9 +1648,9 @@ def print_result(result: dict, verbose: bool = False) -> None:
     host = result["host"]
     verdict = result["verdict"]
     if result["vulnerable"] is True:
-        status = colorize("[LIKELY VULNERABLE]", Colors.RED + Colors.BOLD)
+        status = colorize("[PROBABLEMENT VULNÉRABLE]", Colors.RED + Colors.BOLD)
     elif verdict == "PATCHED_VERSION_ADVERTISED":
-        status = colorize("[PATCHED VERSION ADVERTISED]", Colors.GREEN)
+        status = colorize("[VERSION CORRIGÉE ANNONCÉE]", Colors.GREEN)
     elif verdict in {
         "AT_RISK_VERSION",
         "LEGACY_VERSION_REVIEW",
@@ -1533,51 +1658,53 @@ def print_result(result: dict, verbose: bool = False) -> None:
         "REDIRECT_OUT_OF_SCOPE",
         "REDIRECT_DURING_PROBE",
     }:
-        status = colorize("[REVIEW REQUIRED]", Colors.YELLOW + Colors.BOLD)
+        status = colorize("[VÉRIFICATION REQUISE]", Colors.YELLOW + Colors.BOLD)
     elif verdict in {"INCONCLUSIVE", "PARTIAL_MULTI_IP_COVERAGE"}:
-        status = colorize("[INCONCLUSIVE]", Colors.YELLOW)
+        status = colorize("[NON CONCLUANT]", Colors.YELLOW)
     else:
-        status = colorize("[ERROR]", Colors.YELLOW)
+        status = colorize("[ERREUR]", Colors.YELLOW)
 
     details = []
     if result.get("status_code") is not None:
-        details.append(f"Status: {result['status_code']}")
+        details.append(f"Statut HTTP : {result['status_code']}")
     if result.get("sapi"):
         details.append(f"SAPI: {result['sapi']}")
     if verdict:
-        details.append(f"Verdict: {verdict}")
+        details.append(f"Verdict : {verdict}")
     suffix = " - " + " - ".join(details) if details else ""
     print(f"{status} {colorize(terminal_safe(host), Colors.WHITE)}{suffix}")
 
     if result.get("tls_status"):
-        tls_suffix = " (test continued without certificate validation)" if result.get(
-            "tls_tested_insecurely"
-        ) else ""
+        tls_suffix = (
+            " (test poursuivi sans validation du certificat)"
+            if result.get("tls_tested_insecurely")
+            else ""
+        )
         print(f"  -> TLS: {result['tls_status']}{tls_suffix}")
     if result.get("tls_error") and verbose:
-        print(f"  -> TLS detail: {terminal_safe(result['tls_error'])}")
+        print(f"  -> Détail TLS : {terminal_safe(result['tls_error'])}")
 
     if result.get("multiple_addresses"):
         addresses = ", ".join(result["dns_addresses"])
-        print(f"  -> DNS resolved to multiple addresses: {addresses}")
+        print(f"  -> DNS résolu vers plusieurs adresses : {addresses}")
     if result.get("connect_ip"):
-        print(f"  -> Connected directly to: {result['connect_ip']}")
+        print(f"  -> Connexion directe à : {result['connect_ip']}")
     if result.get("final_url") and result.get("final_url") != result.get("tested_url"):
-        print(f"  -> Retargeted to: {terminal_safe(result['final_url'])}")
+        print(f"  -> URL finale : {terminal_safe(result['final_url'])}")
     if result.get("redirect_blocked"):
-        print(f"  -> Redirect blocked: {terminal_safe(result['redirect_blocked'])}")
+        print(f"  -> Redirection bloquée : {terminal_safe(result['redirect_blocked'])}")
     for guideline in result.get("guidelines", []):
-        print(f"  -> Guidance: {terminal_safe(guideline)}")
+        print(f"  -> Recommandation : {terminal_safe(guideline)}")
     if verbose and result.get("reason"):
         print(f"  -> {terminal_safe(result['reason'])}")
     if verbose and result.get("response"):
-        print(colorize("  Response snippet:", Colors.CYAN))
+        print(colorize("  Extrait de la réponse :", Colors.CYAN))
         for line in result["response"].split("\r\n")[:10]:
             print(f"    {terminal_safe(line)}")
     if verbose and len(result.get("endpoint_results", [])) > 1:
-        print(colorize("  Endpoint results:", Colors.CYAN))
+        print(colorize("  Résultats par point de terminaison :", Colors.CYAN))
         for endpoint in result["endpoint_results"]:
-            endpoint_label = endpoint.get("connect_ip") or "system DNS"
+            endpoint_label = endpoint.get("connect_ip") or "résolution système"
             print(
                 f"    {endpoint_label} {endpoint.get('tested_url')}: "
                 f"{endpoint.get('verdict')} / TLS {endpoint.get('tls_status')}"
@@ -1586,31 +1713,40 @@ def print_result(result: dict, verbose: bool = False) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="php2shell Scanner",
+        description="Assistant d'évaluation externe PHP2Shell",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s -u https://example.com
-  %(prog)s -u https://example.com --active --scan-each-ip
-  %(prog)s -l hosts.txt --active -t 2 -o results.json
-  %(prog)s -u https://example.com --path /index.php
+Exemples :
+  %(prog)s -u https://exemple.fr
+  %(prog)s -u https://exemple.fr --active --scan-each-ip
+  %(prog)s --batch cibles.txt --active -t 2 -o resultats.json
+  %(prog)s -u https://exemple.fr --path /index.php
         """,
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("-u", "--url", help="Single URL/host to check")
+    input_group.add_argument("-u", "--url", help="URL ou hôte unique à tester")
     input_group.add_argument(
-        "-l", "--list", help="File containing hosts (one per line)"
+        "-l",
+        "--list",
+        "--batch",
+        dest="list",
+        metavar="FICHIER",
+        help="fichier batch contenant une cible par ligne",
     )
     parser.add_argument(
-        "-t", "--threads", type=int, default=1, help="Concurrent threads (default: 1)"
+        "-t",
+        "--threads",
+        type=int,
+        default=1,
+        help="nombre de traitements simultanés (défaut : 1)",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=60,
-        help="Request timeout in seconds (default: 60)",
+        help="délai maximal d'une requête en secondes (défaut : 60)",
     )
-    parser.add_argument("-o", "--output", help="Output file for results (JSON)")
+    parser.add_argument("-o", "--output", help="fichier de résultats JSON")
     parser.add_argument(
         "--all-results",
         action="store_true",
@@ -1619,28 +1755,28 @@ Examples:
     parser.add_argument(
         "--vulnerable-only",
         action="store_true",
-        help="Save only likely-vulnerable results (default: save the full audit trail)",
+        help="n'enregistrer que les résultats probablement vulnérables",
     )
     parser.add_argument(
         "--active",
         action="store_true",
-        help="Send memory-pressure probes; authorised targets only",
+        help="envoyer les sondes de pression mémoire ; cibles autorisées uniquement",
     )
     parser.add_argument(
         "--scan-each-ip",
         action="store_true",
-        help="Test every resolved A/AAAA address while preserving HTTP Host and TLS SNI",
+        help="tester chaque adresse A/AAAA en conservant Host et le SNI du FQDN",
     )
     parser.add_argument(
         "--include-response-body",
         action="store_true",
-        help="Include up to 2 KiB of response bodies in output (may expose sensitive data)",
+        help="inclure jusqu'à 2 Kio des corps de réponse (données sensibles possibles)",
     )
     parser.add_argument(
         "-k",
         "--insecure",
         action="store_true",
-        help="Skip the initial TLS verification attempt (not recommended)",
+        help="ignorer la validation TLS initiale (déconseillé)",
     )
     redirect_group = parser.add_mutually_exclusive_group()
     redirect_group.add_argument(
@@ -1653,7 +1789,7 @@ Examples:
         "--no-follow-redirects",
         dest="follow_redirects",
         action="store_false",
-        help="Do not follow redirects (same-host redirects are followed by default)",
+        help="ne suivre aucune redirection (le même hôte est suivi par défaut)",
     )
     parser.set_defaults(follow_redirects=True)
     parser.add_argument(
@@ -1662,31 +1798,37 @@ Examples:
         action="append",
         dest="headers",
         metavar="HEADER",
-        help="Custom header in 'Key: Value' format; repeatable",
+        help="en-tête au format 'Nom: Valeur' ; option répétable",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Show verdict reasons and response snippets",
+        help="afficher les motifs des verdicts et des extraits de réponse",
     )
     parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Only print results requiring attention"
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="n'afficher que les résultats nécessitant une attention",
     )
     parser.add_argument(
-        "--no-color", action="store_true", help="Disable colored output"
+        "--no-color", action="store_true", help="désactiver les couleurs"
     )
     parser.add_argument(
         "--sapi",
         choices=("auto", "mod_php", "fpm"),
         default="auto",
-        help="Verdict rules to use (default: auto)",
+        help="règles de verdict à appliquer (défaut : auto)",
     )
     parser.add_argument(
-        "--path", action="append", dest="paths", help="Custom path to test; repeatable"
+        "--path",
+        action="append",
+        dest="paths",
+        help="chemin spécifique à tester ; option répétable",
     )
     parser.add_argument(
-        "--path-file", help="File containing paths to test (one per line)"
+        "--path-file", help="fichier contenant un chemin par ligne"
     )
     return parser
 
@@ -1694,9 +1836,9 @@ Examples:
 def main() -> None:
     args = build_parser().parse_args()
     if args.threads < 1:
-        raise SystemExit("--threads must be at least 1")
+        raise SystemExit("--threads doit être supérieur ou égal à 1")
     if args.timeout < 1:
-        raise SystemExit("--timeout must be at least 1")
+        raise SystemExit("--timeout doit être supérieur ou égal à 1")
 
     if args.no_color or not sys.stdout.isatty():
         for name in ("RED", "GREEN", "YELLOW", "CYAN", "WHITE", "BOLD", "RESET"):
@@ -1707,56 +1849,56 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    loaded_hosts = [args.url] if args.url else load_lines(args.list, "host")
+    loaded_hosts = [args.url] if args.url else load_lines(args.list, "cibles")
     hosts = deduplicate_hosts(loaded_hosts)
     if not hosts:
-        raise SystemExit("No hosts to scan")
+        raise SystemExit("Aucune cible à tester")
 
     paths: Optional[List[str]] = None
     if args.path_file:
-        paths = load_lines(args.path_file, "path")
+        paths = load_lines(args.path_file, "chemins")
     elif args.paths:
         paths = args.paths
     if paths == []:
-        raise SystemExit("No paths to scan")
+        raise SystemExit("Aucun chemin à tester")
 
     if not args.quiet:
         print_banner()
-        print(colorize(f"[*] Loaded {len(hosts)} host(s) to scan", Colors.CYAN))
+        print(colorize(f"[*] {len(hosts)} cible(s) unique(s) chargée(s)", Colors.CYAN))
         if len(hosts) != len(loaded_hosts):
             duplicate_count = len(loaded_hosts) - len(hosts)
             print(
                 colorize(
-                    f"[*] Skipped {duplicate_count} duplicate host(s)", Colors.CYAN
+                    f"[*] {duplicate_count} doublon(s) ignoré(s)", Colors.CYAN
                 )
             )
         if paths:
-            print(colorize(f"[*] Testing {len(paths)} custom path(s)", Colors.CYAN))
+            print(colorize(f"[*] {len(paths)} chemin(s) spécifique(s)", Colors.CYAN))
         else:
-            print(colorize(f"[*] Default path: {DEFAULT_PATH}", Colors.CYAN))
-        print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
-        print(colorize(f"[*] Timeout: {args.timeout}s", Colors.CYAN))
-        print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
+            print(colorize(f"[*] Chemin par défaut : {DEFAULT_PATH}", Colors.CYAN))
+        print(colorize(f"[*] Traitements simultanés : {args.threads}", Colors.CYAN))
+        print(colorize(f"[*] Délai maximal : {args.timeout}s", Colors.CYAN))
+        print(colorize(f"[*] Règles SAPI : {args.sapi}", Colors.CYAN))
         print(
             colorize(
-                "[*] Redirects: same hostname only (enabled by default)"
+                "[*] Redirections : même nom d'hôte uniquement (activé par défaut)"
                 if args.follow_redirects
-                else "[*] Redirects: disabled",
+                else "[*] Redirections : désactivées",
                 Colors.CYAN,
             )
         )
         print(
             colorize(
-                "[*] Mode: active memory-pressure probes"
+                "[*] Mode : sondes actives de pression mémoire"
                 if args.active
-                else "[*] Mode: low-impact discovery request only",
+                else "[*] Mode : découverte à faible impact uniquement",
                 Colors.YELLOW if args.active else Colors.CYAN,
             )
         )
         if args.scan_each_ip:
-            print(colorize("[*] Testing every resolved IP address", Colors.CYAN))
+            print(colorize("[*] Test de chaque adresse IP résolue", Colors.CYAN))
         if args.insecure:
-            print(colorize("[!] TLS verification disabled", Colors.YELLOW))
+            print(colorize("[!] Validation TLS désactivée", Colors.YELLOW))
         print()
 
     verify_ssl = not args.insecure
@@ -1779,7 +1921,7 @@ def main() -> None:
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
-            result["error"] = f"unexpected error: {exc}"
+            result["error"] = f"erreur inattendue : {exc}"
             result["reason"] = result["error"]
             return attach_guidelines(result)
 
@@ -1793,18 +1935,22 @@ def main() -> None:
         if not args.quiet or result["vulnerable"] is not False:
             print_result(result, args.verbose)
     else:
+        indexed_results: Dict[int, dict] = {}
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {executor.submit(scan, host): host for host in hosts}
+            futures = {
+                executor.submit(scan, host): index
+                for index, host in enumerate(hosts)
+            }
             with tqdm(
                 total=len(hosts),
-                desc=colorize("Scanning", Colors.CYAN),
-                unit="host",
+                desc=colorize("Analyse", Colors.CYAN),
+                unit="cible",
                 ncols=80,
                 disable=args.quiet,
             ) as progress:
                 for future in as_completed(futures):
                     result = future.result()
-                    results.append(result)
+                    indexed_results[futures[future]] = result
 
                     should_print = result["vulnerable"] is not False or not args.quiet
                     if should_print:
@@ -1814,31 +1960,67 @@ def main() -> None:
                             with tqdm.external_write_mode():
                                 print_result(result, args.verbose)
                     progress.update(1)
+        results = [indexed_results[index] for index in range(len(hosts))]
 
-    vulnerable_count = sum(result["vulnerable"] is True for result in results)
-    attention_count = sum(result["vulnerable"] is None for result in results)
-    patched_count = sum(result["vulnerable"] is False for result in results)
-    tls_summary: Dict[str, int] = {}
-    for result in results:
-        endpoints = result.get("endpoint_results") or [result]
-        for endpoint in endpoints:
-            tls_status = endpoint.get("tls_status") or "UNKNOWN"
-            tls_summary[tls_status] = tls_summary.get(tls_status, 0) + 1
+    summary = build_summary(results, input_count=len(loaded_hosts))
+    summary["configuration"] = {
+        "mode": "active" if args.active else "discovery",
+        "sapi": args.sapi,
+        "scan_each_ip": args.scan_each_ip,
+        "follow_same_host_redirects": args.follow_redirects,
+        "initial_tls_verification": verify_ssl,
+        "threads": args.threads,
+        "paths": paths or [DEFAULT_PATH],
+    }
+    vulnerable_count = summary["outcomes"]["likely_vulnerable"]
+    attention_count = summary["outcomes"]["review_inconclusive_or_error"]
     if not args.quiet:
         print()
         print(colorize("=" * 60, Colors.CYAN))
-        print(colorize("SCAN SUMMARY", Colors.BOLD))
+        print(colorize("SYNTHÈSE DU SCAN", Colors.BOLD))
         print(colorize("=" * 60, Colors.CYAN))
-        print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Likely vulnerable: {vulnerable_count}"
+        print(f"  Entrées fournies : {summary['input_entries']}")
+        print(f"  Cibles uniques : {summary['unique_targets']}")
+        print(f"  Points de terminaison testés : {summary['tested_endpoints']}")
+        if summary["duplicate_entries_ignored"]:
+            print(
+                "  Doublons ignorés : "
+                f"{summary['duplicate_entries_ignored']}"
+            )
+        type_summary = ", ".join(
+            f"{name}={count}"
+            for name, count in summary["target_types"].items()
+        )
+        print(f"  Types de cibles : {type_summary}")
+        vulnerable_label = f"Probablement vulnérables : {vulnerable_count}"
         if vulnerable_count:
             vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
         print(f"  {vulnerable_label}")
-        print(f"  Patched version advertised: {patched_count}")
-        print(f"  Review/inconclusive/errors: {attention_count}")
-        print("  TLS endpoint states:")
-        for tls_status, count in sorted(tls_summary.items()):
-            print(f"    {tls_status}: {count}")
+        print(
+            "  Versions corrigées annoncées : "
+            f"{summary['outcomes']['patched_version_advertised']}"
+        )
+        print(f"  À vérifier / non concluants / erreurs : {attention_count}")
+        print("  Verdicts :")
+        for verdict, count in summary["verdicts"].items():
+            print(f"    {verdict}: {count}")
+        print("  États TLS par point de terminaison :")
+        if summary["tls_by_endpoint"]:
+            for tls_status, count in summary["tls_by_endpoint"].items():
+                print(f"    {tls_status}: {count}")
+        else:
+            print("    aucun point de terminaison testé")
+        coverage = summary["coverage"]
+        if coverage["multi_address_targets"]:
+            print(
+                "  Cibles ayant plusieurs adresses : "
+                f"{coverage['multi_address_targets']}"
+            )
+        if coverage["partial_multi_ip_targets"]:
+            print(
+                "  Couvertures multi-IP partielles : "
+                f"{coverage['partial_multi_ip_targets']}"
+            )
         print(colorize("=" * 60, Colors.CYAN))
 
     output_saved = True
@@ -1846,6 +2028,7 @@ def main() -> None:
         output_saved = save_results(
             results,
             args.output,
+            summary=summary,
             vulnerable_only=args.vulnerable_only and not args.all_results,
             announce=not args.quiet,
         )

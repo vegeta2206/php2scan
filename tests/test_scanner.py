@@ -1,4 +1,7 @@
 import io
+import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import AsyncMock, patch
@@ -21,6 +24,86 @@ class VersionVerdictTests(unittest.TestCase):
         self.assertEqual(scanner.version_verdict("PHP/8.1.34"), "LEGACY")
         self.assertIsNone(scanner.version_verdict("PHP/9.0.0"))
         self.assertIsNone(scanner.version_verdict("hidden"))
+
+
+class BatchInputTests(unittest.TestCase):
+    def test_batch_alias_selects_the_input_file(self):
+        args = scanner.build_parser().parse_args(["--batch", "cibles.txt"])
+        self.assertEqual(args.list, "cibles.txt")
+
+    def test_ipv4_ipv6_dns_and_urls_are_normalized(self):
+        cases = {
+            "example.test": "https://example.test/",
+            "192.0.2.10": "https://192.0.2.10/",
+            "2001:db8::10": "https://[2001:db8::10]/",
+            "[2001:db8::10]:8443": "https://[2001:db8::10]:8443/",
+            "http://[2001:db8::10]:8080/app": (
+                "http://[2001:db8::10]:8080/app"
+            ),
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(scanner.normalize_url(raw), expected)
+
+    def test_target_types_are_reported(self):
+        self.assertEqual(scanner.target_type("https://example.test/"), "dns")
+        self.assertEqual(scanner.target_type("https://192.0.2.10/"), "ipv4")
+        self.assertEqual(scanner.target_type("https://[2001:db8::10]/"), "ipv6")
+
+    def test_whitespace_in_a_target_is_rejected_before_resolution(self):
+        with self.assertRaisesRegex(ValueError, "espacement"):
+            scanner.normalize_url("https://invalid target/")
+
+    def test_batch_summary_counts_verdicts_tls_and_coverage(self):
+        vulnerable = {
+            **scanner.base_result("https://example.test/"),
+            "target_type": "dns",
+            "vulnerable": True,
+            "verdict": "LIKELY_VULNERABLE",
+            "tls_status": "MIXED",
+            "multiple_addresses": True,
+            "endpoint_results": [
+                {"tls_status": "TLS_VALID"},
+                {"tls_status": "SELF_SIGNED_CERTIFICATE"},
+            ],
+        }
+        inconclusive = {
+            **scanner.base_result("https://[2001:db8::10]/"),
+            "target_type": "ipv6",
+            "verdict": "INCONCLUSIVE",
+            "tls_status": "TLS_VALID",
+            "endpoint_results": [{"tls_status": "TLS_VALID"}],
+        }
+        summary = scanner.build_summary(
+            [vulnerable, inconclusive], input_count=3
+        )
+        self.assertEqual(summary["input_entries"], 3)
+        self.assertEqual(summary["unique_targets"], 2)
+        self.assertEqual(summary["duplicate_entries_ignored"], 1)
+        self.assertEqual(summary["tested_endpoints"], 3)
+        self.assertEqual(summary["outcomes"]["likely_vulnerable"], 1)
+        self.assertEqual(summary["tls_by_endpoint"]["TLS_VALID"], 2)
+        self.assertEqual(summary["coverage"]["multi_address_targets"], 1)
+
+    def test_json_report_contains_schema_and_summary(self):
+        result = {
+            **scanner.base_result("https://example.test/"),
+            "target_type": "dns",
+            "verdict": "INCONCLUSIVE",
+            "tls_status": "TLS_VALID",
+        }
+        summary = scanner.build_summary([result])
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "rapport.json")
+            self.assertTrue(
+                scanner.save_results(
+                    [result], output, announce=False, summary=summary
+                )
+            )
+            with open(output, "r", encoding="utf-8") as handle:
+                report = json.load(handle)
+        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["summary"]["unique_targets"], 1)
 
 
 class RedirectPolicyTests(unittest.TestCase):
@@ -336,7 +419,7 @@ class OutputSafetyTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             scanner.print_result(result)
-        self.assertIn("[INCONCLUSIVE]", output.getvalue())
+        self.assertIn("[NON CONCLUANT]", output.getvalue())
 
 
 if __name__ == "__main__":

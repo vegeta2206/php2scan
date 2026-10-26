@@ -1,112 +1,121 @@
 # php2scan
 
-External assessment helper for CVE-2026-109618 and CVE-2026-109619.
+Assistant d'évaluation externe pour CVE-2026-109618 et CVE-2026-109619.
 
-This project is based on
-[Assetnote's php2shell-scanner](https://github.com/assetnote/php2shell-scanner)
-and retains its MIT licence. This version adds conservative verdicts, discovery
-and active modes, per-IP testing for multi-address hostnames, safer evidence
-storage, and automated tests.
+Ce projet est fondé sur
+[php2shell-scanner d'Assetnote](https://github.com/assetnote/php2shell-scanner)
+et conserve sa licence MIT. Cette version ajoute des verdicts prudents, des
+modes découverte et actif, le test de chaque adresse d'un FQDN, une politique
+sûre de redirection, un diagnostic TLS, un mode batch, une synthèse exploitable
+et des tests automatisés.
 
-## Important safety notice
+## Avertissement de sécurité important
 
-Active mode is **not a passive vulnerability scan**. It sends crafted multipart
-requests designed to create memory pressure in PHP. One path can receive up to
-three probes totalling roughly 29 MiB. The probes can trigger HTTP 500 errors,
-worker restarts, resource alerts, or service degradation.
+Le mode actif n'est **pas un scan passif**. Il envoie des requêtes multipart
+construites pour provoquer une pression mémoire dans PHP. Un chemin peut
+recevoir jusqu'à trois sondes, soit environ 29 Mio au total. Ces sondes peuvent
+provoquer des réponses HTTP 500, le redémarrage de workers, des alertes de
+ressources ou une dégradation du service.
 
-Only use `--active` against explicitly authorised targets, preferably during a
-maintenance window. Start with one thread, monitor the service, and retain the
-supplier's PHP and web-server logs.
+N'utilisez `--active` que sur des cibles explicitement autorisées, de préférence
+pendant une fenêtre de maintenance. Commencez avec un seul thread, surveillez le
+service et conservez les journaux PHP et serveur web du fournisseur.
 
-## What php2scan can and cannot establish
+## Ce que php2scan peut établir — et ses limites
 
-php2scan is an **external assessment helper**, not a definitive vulnerability
-proof. Its active probes exercise PHP's multipart parser and look for a
-request-local memory exhaustion or worker-failure pattern:
+php2scan est un **assistant d'évaluation externe**, pas une preuve définitive de
+vulnérabilité. Les sondes actives exercent l'analyseur multipart de PHP et
+recherchent la séquence observable suivante :
 
 ```text
-successful control request
-        -> crafted multipart probe
-        -> crash-like HTTP response
-        -> successful recovery control request
+requête de contrôle réussie
+        -> sonde multipart construite
+        -> réponse évoquant une défaillance
+        -> requête de contrôle de récupération réussie
 ```
 
-A positive result is useful evidence for opening a supplier investigation. It
-does not demonstrate arbitrary code execution and it does not prove which of
-the two CVEs is exploitable on that server.
+Un résultat positif constitue un élément utile pour ouvrir une investigation
+avec un fournisseur. Il ne démontre pas une exécution de code arbitraire et ne
+prouve pas laquelle des deux CVE est exploitable sur le serveur.
 
-The scanner cannot remotely establish:
+Le scanner ne peut pas déterminer à distance :
 
-- the package and security revision actually loaded by the web worker;
-- whether an older-looking version contains a distribution or vendor backport;
-- whether a version disclosed by an HTTP header matches the executing runtime;
-- the exact SAPI when the supplier does not disclose it;
-- whether two requests reached the same persistent PHP worker;
-- whether a hidden backend behind a load balancer was reached;
-- whether an observed HTTP 500, 502, 503 or 504 came from PHP, a proxy, a WAF,
-  a rate limit, or an unrelated outage;
-- whether a crash-like condition can be developed into code execution.
+- le paquet et la révision de sécurité réellement chargés par le worker web ;
+- si une version apparemment ancienne contient un rétroportage éditeur ;
+- si une version publiée dans un en-tête HTTP correspond au runtime exécuté ;
+- la SAPI exacte lorsque le fournisseur ne la communique pas ;
+- si deux requêtes ont atteint le même worker PHP persistant ;
+- si un backend masqué derrière un répartiteur a été atteint ;
+- si un code HTTP 500, 502, 503 ou 504 provient de PHP, d'un proxy, d'un WAF,
+  d'une limitation de débit ou d'une panne indépendante ;
+- si un comportement de type crash peut être transformé en exécution de code.
 
-Conversely, no signal does not prove safety. A WAF, reverse proxy, request-size
-limit, load balancer, worker pool, allocator difference, patched-but-old version
-string, hidden error response, or untested application path may prevent the
-observable signal.
+Inversement, l'absence de signal ne prouve pas l'absence de vulnérabilité. Un
+WAF, un proxy inverse, une limite de taille, un répartiteur, un pool de workers,
+un allocateur différent, une chaîne de version ancienne mais corrigée, une
+réponse d'erreur masquée ou un chemin applicatif non testé peuvent empêcher le
+signal observable.
 
-### What the two CVEs mean
+### Principe des deux vulnérabilités
 
-- **CVE-2026-109618 — OOM corruption:** memory exhaustion can interrupt PHP
-  while request state is only partially initialised. Request shutdown may then
-  process invalid state. The multipart probes primarily exercise this externally
-  observable OOM surface.
-- **CVE-2026-109619 — stale global state:** request-owned state can survive in a
-  persistent worker after its memory is released. A later request handled by the
-  same worker may consume that stale state before normal initialisation resets
-  it. Reliable external confirmation is harder because it depends on producer,
-  consumer, worker reuse, configuration and heap state.
+- **CVE-2026-109618 — corruption lors d'un épuisement mémoire :** l'épuisement
+  mémoire peut interrompre PHP alors que l'état de la requête n'est que
+  partiellement initialisé. La phase d'arrêt peut ensuite traiter un état
+  invalide. Les sondes multipart exercent principalement cette surface OOM
+  observable depuis l'extérieur.
+- **CVE-2026-109619 — état global périmé :** un état appartenant à une requête
+  peut subsister dans un worker persistant après la libération de sa mémoire.
+  Une requête ultérieure traitée par le même worker peut consommer cet état avant
+  sa réinitialisation normale. Une confirmation externe fiable est plus
+  difficile, car elle dépend du producteur, du consommateur, de la réutilisation
+  du worker, de la configuration et de l'état du tas mémoire.
 
-Official advisories:
+Avis officiels :
 
 - [CVE-2026-109618 / GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
 - [CVE-2026-109619 / GHSA-6wmf-4rv5-p3rp](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 
-### SAPI-specific interpretation
+### Interprétation selon la SAPI
 
-SAPI is the interface between the web server and PHP:
+La SAPI est l'interface entre le serveur web et PHP :
 
-- `mod_php`: PHP runs inside the Apache worker. This is the highest-risk and
-  best-confirmed exploitation environment in the PHP advisory.
-- `fpm`: Nginx or Apache forwards the request to a persistent PHP-FPM worker.
-  A failed worker may appear externally as an empty response or HTTP
-  502/503/504 and is normally replaced by the FPM master.
-- `auto`: applies both families of external heuristics. It has broader coverage
-  but more ambiguity and therefore a higher false-positive risk.
+- `mod_php` : PHP s'exécute dans le worker Apache. Il s'agit de l'environnement
+  de risque le plus élevé et le mieux confirmé dans l'avis PHP.
+- `fpm` : Nginx ou Apache transmet la requête à un worker PHP-FPM persistant. Un
+  worker défaillant peut apparaître comme une réponse vide ou un code HTTP
+  502/503/504, puis être remplacé par le processus maître FPM.
+- `auto` : applique les deux familles d'heuristiques externes. La couverture est
+  plus large, mais l'ambiguïté et le risque de faux positif sont supérieurs.
 
-Use `--sapi mod_php` or `--sapi fpm` when the supplier has confirmed the SAPI.
-Do not infer the SAPI solely from the `Server` HTTP header.
+Utilisez `--sapi mod_php` ou `--sapi fpm` lorsque le fournisseur a confirmé la
+SAPI. Ne déduisez pas la SAPI du seul en-tête HTTP `Server`.
 
 ## Verdicts
 
-| Verdict | Meaning |
+Les identifiants restent en anglais afin de préserver la stabilité des rapports
+JSON et des automatisations.
+
+| Verdict | Interprétation |
 | --- | --- |
-| `LIKELY_VULNERABLE` | Active crash-like signal observed; supplier-side logs and runtime must confirm it. |
-| `SUSPICIOUS_SIGNAL` | Crash-like signal conflicts with an advertised patched version; possible resource-limit or proxy false positive. |
-| `AT_RISK_VERSION` | HTTP advertises a supported PHP branch below the upstream fixed release; vendor backports remain possible. |
-| `LEGACY_VERSION_REVIEW` | HTTP advertises an end-of-life PHP branch; request vendor backport evidence. |
-| `PATCHED_VERSION_ADVERTISED` | HTTP advertises a fixed upstream version; this is evidence, not proof of the actual runtime. |
-| `PARTIAL_MULTI_IP_COVERAGE` | A multi-address hostname was not tested on every resolved node. |
-| `REDIRECT_OUT_OF_SCOPE` | Discovery stopped because a redirect changed the hostname. No probe was sent to the destination. |
-| `REDIRECT_DURING_PROBE` | The final endpoint redirected an active probe; the large body was not replayed. |
-| `INCONCLUSIVE` | No reliable external conclusion can be drawn. |
-| `ERROR` | The assessment could not be completed. |
+| `LIKELY_VULNERABLE` | Signal actif compatible avec la vulnérabilité ; les journaux et le runtime du fournisseur doivent le confirmer. |
+| `SUSPICIOUS_SIGNAL` | Signal de défaillance contradictoire avec une version annoncée corrigée ; faux positif de limite de ressources ou de proxy possible. |
+| `AT_RISK_VERSION` | HTTP annonce une branche PHP prise en charge, mais antérieure à la version amont corrigée ; un rétroportage reste possible. |
+| `LEGACY_VERSION_REVIEW` | HTTP annonce une branche PHP en fin de vie ; demander la preuve du rétroportage fournisseur. |
+| `PATCHED_VERSION_ADVERTISED` | HTTP annonce une version amont corrigée ; c'est un indice, pas la preuve du runtime réellement exécuté. |
+| `PARTIAL_MULTI_IP_COVERAGE` | Un FQDN possédant plusieurs adresses n'a pas été testé sur chaque adresse. |
+| `REDIRECT_OUT_OF_SCOPE` | La découverte s'est arrêtée parce que la redirection changeait de nom d'hôte. Aucune sonde n'a été envoyée à la destination. |
+| `REDIRECT_DURING_PROBE` | Le point final a redirigé une sonde active ; le corps volumineux n'a pas été rejoué. |
+| `INCONCLUSIVE` | Aucune conclusion externe fiable n'est possible. |
+| `ERROR` | L'évaluation n'a pas pu être effectuée. |
 
-Absence of a crash-like signal is never reported as "not vulnerable".
+L'absence de signal de défaillance n'est jamais présentée comme « non
+vulnérable ».
 
-## Requirements
+## Prérequis et installation
 
-- Python 3.9+
-- `h11`
-- `tqdm`
+- Python 3.9 ou supérieur ;
+- `h11` ;
+- `tqdm`.
 
 ```bash
 python3 -m venv .venv
@@ -114,233 +123,331 @@ python3 -m venv .venv
 python3 -m pip install -r requirements.txt
 ```
 
-## Usage
+## Utilisation
 
-Low-impact discovery (one small multipart POST; it is not a purely passive
-network observation):
+Découverte à faible impact — une petite requête multipart, donc pas une simple
+observation réseau passive :
 
 ```bash
-python3 scanner.py -u https://example.com
+python3 scanner.py -u https://exemple.fr
 ```
 
-Authorised active assessment of one hostname:
+Évaluation active autorisée d'un hôte :
 
 ```bash
-python3 scanner.py -u https://example.com --active -o result.json
+python3 scanner.py -u https://exemple.fr --active -o resultat.json
 ```
 
-Same-host redirects are followed by default. HTTP to HTTPS and path changes are
-allowed when the hostname is unchanged. A redirect to another hostname is
-stopped and reported as `REDIRECT_OUT_OF_SCOPE`; add that destination as a
-separate authorised target if required. Here, "same equipment" is deliberately
-defined as the exact same canonical hostname (case-insensitive, with a trailing
-dot ignored). Sharing an IP address is not enough: that address may host several
-customers or services. A port or scheme change on the same hostname is allowed,
-but authentication headers are removed when the origin changes. Disable all
-redirect following with:
+Test de chemins PHP précis :
 
 ```bash
-python3 scanner.py -u https://example.com --no-follow-redirects
-```
-
-Only the small discovery/control request follows allowed redirects. Active
-memory-pressure probes are sent directly to the discovered same-host final URL
-and are never replayed through a new redirect.
-
-Test every resolved A/AAAA address while preserving the FQDN in the HTTP Host
-header and TLS SNI:
-
-```bash
-python3 scanner.py -u https://example.com --active --scan-each-ip -o result.json
-```
-
-Test selected PHP paths:
-
-```bash
-python3 scanner.py -u https://example.com --active \
+python3 scanner.py -u https://exemple.fr --active \
   --path /index.php --path /admin/index.php
 ```
 
-Multiple hosts, with deliberately limited concurrency:
+Les corps de réponse sont omis des preuves par défaut. Pour les inclure dans une
+investigation autorisée :
 
 ```bash
-python3 scanner.py -l hosts.txt --active --scan-each-ip \
-  --threads 2 --output results.json
+python3 scanner.py -u https://exemple.fr --active --include-response-body
 ```
 
-Response bodies are omitted from stored evidence by default. If they are
-required for an authorised investigation, enable them explicitly:
+Les corps peuvent contenir des données applicatives sensibles. Les en-têtes
+d'authentification sont masqués dans les rapports, mais un secret fourni sur la
+ligne de commande peut rester visible dans l'historique du shell ou la liste des
+processus.
+
+## Mode batch et synthèse
+
+`--batch` et `--list` sont deux noms de la même option. Le fichier accepte une
+cible par ligne : FQDN, IPv4, IPv6 ou URL HTTP/HTTPS. Les lignes vides et celles
+commençant par `#` sont ignorées. Une cible sans schéma utilise HTTPS par défaut.
+
+Exemple `cibles.txt` :
+
+```text
+# FQDN : HTTPS par défaut
+app.exemple.fr
+
+# IPv4 et IPv6 littérales : HTTPS par défaut
+192.0.2.10
+2001:db8::10
+
+# Un port avec une IPv6 exige les crochets usuels
+[2001:db8::20]:8443
+
+# URL et protocole explicites
+http://192.0.2.30:8080/index.php
+https://portail.exemple.fr/admin/index.php
+```
+
+Exécution recommandée pour commencer, avec une concurrence volontairement
+faible :
 
 ```bash
-python3 scanner.py -u https://example.com --active --include-response-body
+python3 scanner.py --batch cibles.txt --scan-each-ip \
+  --threads 2 --output resultats.json
 ```
 
-Bodies can contain sensitive application data. Authentication headers are
-redacted in reports, but passing secrets on a command line can still expose
-them through shell history or the process list.
+Ajoutez `--active` uniquement après validation du périmètre et de la fenêtre de
+test :
 
-## TLS assessment and fallback
+```bash
+python3 scanner.py --batch cibles.txt --active --scan-each-ip \
+  --sapi mod_php --threads 1 --output resultats.json
+```
 
-TLS validation is attempted automatically for every HTTPS endpoint. If the
-certificate is expired, self-signed, untrusted or does not match the hostname,
-php2scan records the failure and retries without certificate validation so the
-authorised PHP assessment can continue. The report clearly states that the test
-continued insecurely. A protocol/cipher negotiation failure can still prevent
-the HTTP assessment.
+La synthèse console contient :
 
-| TLS state | Meaning and guidance |
+- le nombre d'entrées, de doublons et de cibles uniques ;
+- la répartition FQDN/IPv4/IPv6 ;
+- le nombre de points de terminaison effectivement testés ;
+- les totaux par verdict ;
+- les états TLS par point de terminaison ;
+- les couvertures multi-IP partielles.
+
+Le fichier JSON conserve les résultats détaillés dans l'ordre du fichier
+d'entrée et ajoute un objet `summary` structuré avec les mêmes indicateurs :
+
+```json
+{
+  "schema_version": 2,
+  "scan_time": "2026-10-26T17:00:00Z",
+  "total_results": 3,
+  "summary": {
+    "input_entries": 4,
+    "unique_targets": 3,
+    "tested_endpoints": 5,
+    "duplicate_entries_ignored": 1,
+    "target_types": {"dns": 1, "ipv4": 1, "ipv6": 1},
+    "outcomes": {
+      "likely_vulnerable": 1,
+      "patched_version_advertised": 0,
+      "review_inconclusive_or_error": 2
+    },
+    "verdicts": {"INCONCLUSIVE": 2, "LIKELY_VULNERABLE": 1},
+    "tls_by_target": {"MIXED": 1, "TLS_VALID": 2},
+    "tls_by_endpoint": {
+      "SELF_SIGNED_CERTIFICATE": 1,
+      "TLS_VALID": 4
+    },
+    "coverage": {
+      "multi_address_targets": 1,
+      "partial_multi_ip_targets": 0
+    },
+    "configuration": {
+      "mode": "discovery",
+      "sapi": "auto",
+      "scan_each_ip": true,
+      "follow_same_host_redirects": true,
+      "initial_tls_verification": true,
+      "threads": 2,
+      "paths": ["/"]
+    }
+  },
+  "results": []
+}
+```
+
+Avec `--vulnerable-only`, le tableau `results` est filtré, mais `summary`
+continue de décrire l'ensemble du scan afin de conserver la piste d'audit.
+
+## Politique de redirection
+
+Les redirections vers le même nom d'hôte sont suivies par défaut. Les changements
+HTTP vers HTTPS, de port et de chemin sont autorisés tant que le nom d'hôte ne
+change pas. Une redirection vers un autre nom d'hôte est arrêtée et signalée par
+`REDIRECT_OUT_OF_SCOPE` ; ajoutez cette destination comme cible autorisée
+distincte si nécessaire.
+
+Dans php2scan, « même équipement » est volontairement traduit par **même nom
+d'hôte canonique** — casse ignorée et point terminal supprimé. Une IP partagée ne
+suffit pas : elle peut héberger plusieurs clients ou services. Cette règle ne
+garantit toutefois pas que deux requêtes atteignent le même serveur physique
+derrière un répartiteur.
+
+Lors d'un changement de schéma ou de port, les en-têtes sensibles sont retirés.
+Pour désactiver toutes les redirections :
+
+```bash
+python3 scanner.py -u https://exemple.fr --no-follow-redirects
+```
+
+Seule la petite requête de découverte ou de contrôle suit les redirections
+autorisées. Les sondes actives de pression mémoire sont envoyées directement à
+l'URL finale découverte et ne sont jamais rejouées après une nouvelle
+redirection.
+
+## Diagnostic TLS et poursuite du test
+
+La validation TLS est tentée automatiquement pour chaque cible HTTPS. Si le
+certificat est expiré, autosigné, non reconnu ou ne correspond pas au nom
+d'hôte, php2scan enregistre l'échec puis recommence sans validation du
+certificat afin que le test PHP autorisé puisse continuer. Le rapport indique
+explicitement cette poursuite non vérifiée. Un échec de négociation de protocole
+ou de suite cryptographique peut toujours empêcher le test HTTP.
+
+| État TLS | Interprétation et recommandation |
 | --- | --- |
-| `TLS_VALID` | Certificate validation succeeded. Protocols, ciphers and lifetime still require a dedicated TLS review. |
-| `SELF_SIGNED_CERTIFICATE` | Test continued insecurely. Use a trusted public certificate or the approved private trust anchor. |
-| `EXPIRED_CERTIFICATE` | Test continued insecurely. Renew the certificate and deploy the correct intermediate chain. |
-| `HOSTNAME_MISMATCH` | Test continued insecurely. Add the tested FQDN to the certificate SAN. |
-| `UNTRUSTED_CERTIFICATE` | Test continued insecurely. Repair the chain or use the approved enterprise CA. |
-| `TLS_VERIFICATION_DISABLED` | `--insecure` prevented normal validation; rerun without it for usable TLS evidence. |
-| `TLS_HANDSHAKE_FAILED` | No HTTP test was possible. Investigate protocols, ciphers, SNI and server logs. |
-| `TLS_CONNECTION_FAILED` | Check listener, firewall, proxy and HTTPS reachability. |
-| `HTTPS_TO_HTTP_DOWNGRADE` | Remove the downgrade and keep the complete path encrypted. |
-| `PLAINTEXT_HTTP` | Enable HTTPS and redirect HTTP to HTTPS on the same hostname. |
-| `MIXED` | Resolved endpoints have different TLS states; remediate and retest every IP. |
+| `TLS_VALID` | Le certificat est valide. Les protocoles, suites cryptographiques et durées de vie nécessitent néanmoins un audit TLS distinct. |
+| `SELF_SIGNED_CERTIFICATE` | Le test a continué sans validation. Utiliser un certificat public reconnu ou l'autorité privée approuvée. |
+| `EXPIRED_CERTIFICATE` | Le test a continué sans validation. Renouveler le certificat et déployer la chaîne intermédiaire correcte. |
+| `HOSTNAME_MISMATCH` | Le test a continué sans validation. Ajouter le FQDN testé au SAN du certificat. |
+| `UNTRUSTED_CERTIFICATE` | Le test a continué sans validation. Réparer la chaîne ou utiliser l'autorité d'entreprise approuvée. |
+| `TLS_VERIFICATION_DISABLED` | `--insecure` a empêché le diagnostic normal ; relancer sans cette option pour obtenir une preuve exploitable. |
+| `TLS_HANDSHAKE_FAILED` | Aucun test HTTP possible. Examiner protocoles, suites cryptographiques, SNI et journaux serveur. |
+| `TLS_CONNECTION_FAILED` | Vérifier le service en écoute, le pare-feu, le proxy et l'accessibilité HTTPS. |
+| `HTTPS_TO_HTTP_DOWNGRADE` | Supprimer la redirection vers HTTP et conserver le chiffrement de bout en bout. |
+| `PLAINTEXT_HTTP` | Activer HTTPS et rediriger HTTP vers HTTPS sur le même nom d'hôte. |
+| `MIXED` | Les adresses résolues ont des états TLS différents ; corriger et retester chaque IP. |
 
-`--insecure` remains available for compatibility, but it skips the initial
-validation attempt and therefore produces weaker evidence. The default
-automatic validate-then-fallback behaviour is recommended.
+`--insecure` reste disponible pour compatibilité, mais saute la validation
+initiale et produit donc une preuve TLS moins utile. Le comportement par défaut
+« validation puis poursuite contrôlée » est recommandé.
 
-Every result includes human-readable `guidelines` for both its vulnerability
-verdict and TLS state. Standard output shows the TLS state for each host, while
-the final summary counts TLS states across tested endpoints.
+Chaque résultat contient des `guidelines` en français pour son verdict et son
+état TLS. La sortie standard affiche l'état TLS de chaque cible et la synthèse
+compte les états de tous les points de terminaison.
 
-## Exit codes
+## Comportement multi-IP
 
-- `0`: every result advertised a patched upstream version
-- `1`: at least one active `LIKELY_VULNERABLE` result
-- `2`: review required, inconclusive/error result, or output-write failure
+La résolution DNS normale peut ne sélectionner qu'un seul backend. Si un FQDN
+possède plusieurs adresses et que `--scan-each-ip` n'est pas utilisé, php2scan
+refuse de considérer le FQDN comme couvert et retourne
+`PARTIAL_MULTI_IP_COVERAGE`.
 
-## Multi-IP behaviour
+`--scan-each-ip` se connecte directement à chaque adresse résolue tout en
+conservant le FQDN dans l'en-tête HTTP `Host` et le SNI TLS :
 
-Normal DNS resolution may select only one backend. If a hostname has multiple
-addresses and `--scan-each-ip` is not used, php2scan refuses to clear the whole
-hostname and returns `PARTIAL_MULTI_IP_COVERAGE`.
+```bash
+python3 scanner.py -u https://exemple.fr --active \
+  --scan-each-ip --output resultat.json
+```
 
-`--scan-each-ip` connects directly to every resolved address while retaining
-the original FQDN for virtual hosting and TLS certificate validation. It does
-not discover unknown FQDNs hosted on an IP address.
+Cette option ne découvre pas les FQDN inconnus hébergés sur une adresse IP. La
+liste d'adresses est un instantané fourni par le résolveur et le point réseau du
+scanner. Le Geo-DNS, les TTL courts et le DNS à vues séparées peuvent fournir
+d'autres adresses ailleurs. Tester toutes les adresses résolues n'énumère pas :
 
-The address set is a DNS snapshot from the scanner's resolver and network
-location. Geo-DNS, short TTLs and split-horizon DNS may return different
-addresses elsewhere. Testing every resolved address still does not enumerate:
+- plusieurs serveurs applicatifs cachés derrière la même IP de répartiteur ;
+- les origines d'un CDN ou d'un proxy inverse ;
+- les sites anycast partageant la même adresse ;
+- les backends choisis selon les cookies, l'adresse cliente, l'état de santé ou
+  la persistance de session.
 
-- multiple application servers hidden behind one load-balancer VIP;
-- CDN or reverse-proxy origin servers;
-- anycast sites sharing one IP address;
-- backends selected by cookies, client address, health state or session
-  persistence.
+Pour un FQDN multi-adresse, utilisez `--scan-each-ip --verbose` et conservez tous
+les `endpoint_results`.
 
-For multi-address hostnames, run with `--scan-each-ip --verbose` and retain all
-`endpoint_results`. If only one address is tested, php2scan returns
-`PARTIAL_MULTI_IP_COVERAGE` instead of clearing the FQDN.
+## Codes de sortie
 
-## Interpreting external findings
+- `0` : toutes les cibles annoncent une version amont corrigée ;
+- `1` : au moins un résultat actif est `LIKELY_VULNERABLE` ;
+- `2` : vérification requise, résultat non concluant, erreur ou échec d'écriture.
 
-External evidence should be combined with information from the hosting
-supplier:
+## Exploitation des constats externes
 
-1. the PHP runtime actually serving the tested URL;
-2. the package version and vendor security revision;
-3. whether the vendor applied a backport;
-4. the SAPI in use (`mod_php`, PHP-FPM, CGI, etc.);
-5. web-server and PHP logs at the probe timestamp;
-6. worker restart or crash evidence.
+Les indices externes doivent être rapprochés des informations du fournisseur :
 
-The upstream fixed releases are PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12.
-Version strings alone cannot identify distribution or vendor backports.
+1. runtime PHP servant réellement l'URL testée ;
+2. version du paquet et révision de sécurité fournisseur ;
+3. statut d'un éventuel rétroportage ;
+4. SAPI utilisée (`mod_php`, PHP-FPM, CGI, etc.) ;
+5. journaux du serveur web et de PHP à l'heure exacte de la sonde ;
+6. preuve de redémarrage ou de crash d'un worker.
 
-### Supplier confirmation checklist
+Les versions amont corrigées sont PHP 8.2.35, 8.3.36, 8.4.27 et 8.5.12. Une
+chaîne de version seule ne permet pas d'identifier les rétroportages d'une
+distribution ou d'un fournisseur.
 
-Send the supplier the tested FQDN, resolved IP, path, UTC timestamp, scan mode,
-probe number, HTTP sequence and JSON evidence. Ask the supplier to confirm:
+### Liste de vérification à transmettre au fournisseur
 
-1. the PHP binary and package actually used by the tested web pool;
-2. the SAPI and frontend architecture;
-3. the distribution/vendor security revision and backport status for both CVEs;
-4. PHP, web-server, WAF and reverse-proxy logs at the probe timestamp;
-5. worker termination, restart, OOM or health-check events;
-6. every backend serving the FQDN, not only the public frontend address;
-7. the remediation applied and the post-remediation runtime evidence.
+Communiquez le FQDN, l'IP résolue, le chemin, l'horodatage UTC, le mode, le
+numéro de sonde, la séquence HTTP et la preuve JSON. Demandez confirmation de :
 
-Suggested wording:
+1. la version binaire et le paquet PHP utilisés par le pool web testé ;
+2. la SAPI et l'architecture frontale ;
+3. la révision de sécurité et le statut de rétroportage pour les deux CVE ;
+4. les journaux PHP, serveur web, WAF et proxy à l'heure de la sonde ;
+5. tout arrêt, redémarrage, OOM ou événement de contrôle de santé d'un worker ;
+6. chaque backend desservant le FQDN, pas seulement l'adresse frontale ;
+7. la remédiation appliquée et la preuve du runtime après correction.
 
-> Our authorised external assessment observed behaviour compatible with the
-> PHP2Shell attack surface. This is not proof of exploitation. Please confirm
-> the effective PHP runtime, SAPI, package/vendor backport status and server
-> logs for CVE-2026-109618 and CVE-2026-109619.
+Formulation suggérée :
 
-## Remediation
+> Notre évaluation externe autorisée a observé un comportement compatible avec
+> la surface d'attaque PHP2Shell. Ce constat ne constitue pas une preuve
+> d'exploitation. Merci de confirmer le runtime PHP effectif, la SAPI, le paquet,
+> le statut des rétroportages fournisseur et les journaux serveur pour
+> CVE-2026-109618 et CVE-2026-109619.
 
-Updating is the only complete remediation. Fixed upstream releases are:
+## Remédiation
 
-| Branch | Fixed release |
+La mise à jour est la seule remédiation complète :
+
+| Branche | Version amont corrigée |
 | --- | --- |
 | PHP 8.2 | 8.2.35 |
 | PHP 8.3 | 8.3.36 |
 | PHP 8.4 | 8.4.27 |
 | PHP 8.5 | 8.5.12 |
 
-PHP 8.1 and older are end-of-life upstream. Upgrade to a supported branch or
-obtain explicit evidence of a vendor/LTS backport. Do not decide from the base
-version string alone.
+PHP 8.1 et les branches antérieures sont en fin de vie en amont. Migrez vers une
+branche prise en charge ou obtenez la preuve explicite d'un rétroportage
+fournisseur/LTS. Ne concluez jamais à partir de la seule version de base.
 
-After updating or applying a vendor package:
+Après une mise à jour ou l'installation d'un paquet fournisseur :
 
-1. restart every PHP and web-server worker;
-2. verify the runtime used by the real web pool, not only the CLI binary;
-3. record the package version, vendor advisory and backport revision;
-4. test every relevant SAPI, pool, path and backend;
-5. investigate possible compromise if the service was exposed before patching.
+1. redémarrer tous les workers PHP et serveur web ;
+2. vérifier le runtime utilisé par le pool web réel, pas seulement le binaire CLI ;
+3. consigner la version du paquet, l'avis fournisseur et la révision du rétroportage ;
+4. tester chaque SAPI, pool, chemin et backend pertinent ;
+5. rechercher une éventuelle compromission si le service était exposé avant correction.
 
-### Temporary risk reduction for CVE-2026-109618
+### Réduction temporaire du risque pour CVE-2026-109618
 
-These controls reduce specific paths but do **not** replace updating:
+Ces mesures réduisent certains chemins, mais **ne remplacent pas la mise à jour** :
 
-- administratively enforce `memory_limit=-1` so applications cannot restore a
-  finite PHP limit;
-- enforce conservative decoded request, multipart part, header, upload, input
-  and nesting limits at the frontend;
-- block `multipart/form-data` before PHP where uploads are not required;
-- use container/cgroup limits only as an additional availability boundary;
-- do not use `RLIMIT_AS` or `RLIMIT_DATA` as a workaround, because allocation
-  failure can reach the vulnerable path.
+- imposer administrativement `memory_limit=-1` afin que les applications ne
+  puissent pas rétablir une limite PHP finie ;
+- imposer au frontal des limites prudentes sur les requêtes décodées, parties
+  multipart, en-têtes, téléversements, entrées et niveaux d'imbrication ;
+- bloquer `multipart/form-data` avant PHP lorsque les téléversements sont inutiles ;
+- n'utiliser les limites conteneur/cgroup que comme protection de disponibilité ;
+- ne pas employer `RLIMIT_AS` ou `RLIMIT_DATA` comme contournement, car l'échec
+  d'allocation peut atteindre le chemin vulnérable.
 
-### Temporary risk reduction for CVE-2026-109619
+### Réduction temporaire du risque pour CVE-2026-109619
 
-These controls reduce confirmed producer/consumer paths but are incomplete:
+Ces mesures réduisent les chemins producteur/consommateur confirmés, mais restent
+incomplètes :
 
-- set `session.upload_progress.enabled=0` in administrative configuration that
-  applies before request parsing, then restart every worker;
-- do not rely on application `ini_set()` or FPM `.user.ini` for this mitigation;
-- on PHP 8.5, set `fatal_error_backtraces=0` and restart workers;
-- remove invalid, deprecated or conflicting per-request INI settings that emit
-  diagnostics during early initialisation;
-- fix attacker-reachable fatal errors, timeouts and failures in upload/import or
-  cleanup paths.
+- définir `session.upload_progress.enabled=0` dans une configuration
+  administrative appliquée avant l'analyse de la requête, puis redémarrer tous
+  les workers ;
+- ne pas compter sur `ini_set()` applicatif ou `.user.ini` FPM pour cette mesure ;
+- avec PHP 8.5, définir `fatal_error_backtraces=0` puis redémarrer les workers ;
+- supprimer les réglages INI invalides, obsolètes ou contradictoires qui émettent
+  des diagnostics pendant l'initialisation ;
+- corriger les erreurs fatales, délais dépassés et échecs atteignables par un
+  attaquant dans les chemins de téléversement, import ou nettoyage.
 
-The current PHP project guidance is maintained on
-[php.net](https://www.php.net/) and in the two official advisories linked above.
+Les recommandations courantes du projet PHP sont publiées sur
+[php.net](https://www.php.net/) et dans les deux avis officiels liés plus haut.
 
 ## Docker
 
 ```bash
 docker build -t php2scan .
-docker run --rm php2scan -u https://example.com
-docker run --rm php2scan -u https://example.com --active
+docker run --rm php2scan -u https://exemple.fr
+docker run --rm php2scan -u https://exemple.fr --active
 ```
 
-To read input files and write JSON results:
+Lecture d'un fichier batch et écriture du rapport JSON :
 
 ```bash
 docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/data" -w /data php2scan \
-  -l hosts.txt --active --scan-each-ip -o results.json
+  --batch cibles.txt --active --scan-each-ip -o resultats.json
 ```
 
 ## Tests

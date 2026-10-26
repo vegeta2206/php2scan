@@ -95,6 +95,8 @@ Do not infer the SAPI solely from the `Server` HTTP header.
 | `LEGACY_VERSION_REVIEW` | HTTP advertises an end-of-life PHP branch; request vendor backport evidence. |
 | `PATCHED_VERSION_ADVERTISED` | HTTP advertises a fixed upstream version; this is evidence, not proof of the actual runtime. |
 | `PARTIAL_MULTI_IP_COVERAGE` | A multi-address hostname was not tested on every resolved node. |
+| `REDIRECT_OUT_OF_SCOPE` | Discovery stopped because a redirect changed the hostname. No probe was sent to the destination. |
+| `REDIRECT_DURING_PROBE` | The final endpoint redirected an active probe; the large body was not replayed. |
 | `INCONCLUSIVE` | No reliable external conclusion can be drawn. |
 | `ERROR` | The assessment could not be completed. |
 
@@ -127,6 +129,24 @@ Authorised active assessment of one hostname:
 python3 scanner.py -u https://example.com --active -o result.json
 ```
 
+Same-host redirects are followed by default. HTTP to HTTPS and path changes are
+allowed when the hostname is unchanged. A redirect to another hostname is
+stopped and reported as `REDIRECT_OUT_OF_SCOPE`; add that destination as a
+separate authorised target if required. Here, "same equipment" is deliberately
+defined as the exact same canonical hostname (case-insensitive, with a trailing
+dot ignored). Sharing an IP address is not enough: that address may host several
+customers or services. A port or scheme change on the same hostname is allowed,
+but authentication headers are removed when the origin changes. Disable all
+redirect following with:
+
+```bash
+python3 scanner.py -u https://example.com --no-follow-redirects
+```
+
+Only the small discovery/control request follows allowed redirects. Active
+memory-pressure probes are sent directly to the discovered same-host final URL
+and are never replayed through a new redirect.
+
 Test every resolved A/AAAA address while preserving the FQDN in the HTTP Host
 header and TLS SNI:
 
@@ -158,6 +178,37 @@ python3 scanner.py -u https://example.com --active --include-response-body
 Bodies can contain sensitive application data. Authentication headers are
 redacted in reports, but passing secrets on a command line can still expose
 them through shell history or the process list.
+
+## TLS assessment and fallback
+
+TLS validation is attempted automatically for every HTTPS endpoint. If the
+certificate is expired, self-signed, untrusted or does not match the hostname,
+php2scan records the failure and retries without certificate validation so the
+authorised PHP assessment can continue. The report clearly states that the test
+continued insecurely. A protocol/cipher negotiation failure can still prevent
+the HTTP assessment.
+
+| TLS state | Meaning and guidance |
+| --- | --- |
+| `TLS_VALID` | Certificate validation succeeded. Protocols, ciphers and lifetime still require a dedicated TLS review. |
+| `SELF_SIGNED_CERTIFICATE` | Test continued insecurely. Use a trusted public certificate or the approved private trust anchor. |
+| `EXPIRED_CERTIFICATE` | Test continued insecurely. Renew the certificate and deploy the correct intermediate chain. |
+| `HOSTNAME_MISMATCH` | Test continued insecurely. Add the tested FQDN to the certificate SAN. |
+| `UNTRUSTED_CERTIFICATE` | Test continued insecurely. Repair the chain or use the approved enterprise CA. |
+| `TLS_VERIFICATION_DISABLED` | `--insecure` prevented normal validation; rerun without it for usable TLS evidence. |
+| `TLS_HANDSHAKE_FAILED` | No HTTP test was possible. Investigate protocols, ciphers, SNI and server logs. |
+| `TLS_CONNECTION_FAILED` | Check listener, firewall, proxy and HTTPS reachability. |
+| `HTTPS_TO_HTTP_DOWNGRADE` | Remove the downgrade and keep the complete path encrypted. |
+| `PLAINTEXT_HTTP` | Enable HTTPS and redirect HTTP to HTTPS on the same hostname. |
+| `MIXED` | Resolved endpoints have different TLS states; remediate and retest every IP. |
+
+`--insecure` remains available for compatibility, but it skips the initial
+validation attempt and therefore produces weaker evidence. The default
+automatic validate-then-fallback behaviour is recommended.
+
+Every result includes human-readable `guidelines` for both its vulnerability
+verdict and TLS state. Standard output shows the TLS state for each host, while
+the final summary counts TLS states across tested endpoints.
 
 ## Exit codes
 

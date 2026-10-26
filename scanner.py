@@ -80,6 +80,83 @@ SENSITIVE_HEADERS = {
     "x-api-key",
 }
 
+VERDICT_GUIDANCE = {
+    "LIKELY_VULNERABLE": (
+        "Treat as a priority supplier incident: confirm the effective PHP package, "
+        "SAPI and logs, then update or apply the vendor backport."
+    ),
+    "SUSPICIOUS_SIGNAL": (
+        "Correlate the timestamp with PHP, proxy, WAF and worker logs before "
+        "attributing the signal to PHP2Shell."
+    ),
+    "AT_RISK_VERSION": (
+        "Request vendor backport evidence or update to a fixed upstream release."
+    ),
+    "LEGACY_VERSION_REVIEW": (
+        "Upgrade the end-of-life PHP branch or obtain explicit LTS/vendor patch evidence."
+    ),
+    "PATCHED_VERSION_ADVERTISED": (
+        "Verify the package used by the real web pool and every backend; an HTTP "
+        "version header is supporting evidence, not proof."
+    ),
+    "PARTIAL_MULTI_IP_COVERAGE": (
+        "Rerun with --scan-each-ip and retain every endpoint result."
+    ),
+    "REDIRECT_OUT_OF_SCOPE": (
+        "Add the destination hostname as a separate authorised target; php2scan will "
+        "not send probes across hostname boundaries."
+    ),
+    "REDIRECT_DURING_PROBE": (
+        "Assess the reported final path explicitly after confirming it remains in scope."
+    ),
+    "INCONCLUSIVE": (
+        "Collect supplier-side runtime, package, SAPI and log evidence; no external "
+        "signal is not proof of remediation."
+    ),
+    "ERROR": "Correct reachability or input errors, then rerun the assessment.",
+}
+
+TLS_GUIDANCE = {
+    "TLS_VALID": (
+        "Certificate validation succeeded; separately review supported protocols, "
+        "ciphers and certificate lifetime if TLS posture is in scope."
+    ),
+    "SELF_SIGNED_CERTIFICATE": (
+        "The test continued without certificate validation. Deploy a certificate "
+        "trusted by the intended clients or distribute the private trust anchor."
+    ),
+    "EXPIRED_CERTIFICATE": (
+        "The test continued without certificate validation. Renew and deploy the "
+        "certificate, including the correct intermediate chain."
+    ),
+    "HOSTNAME_MISMATCH": (
+        "The test continued without certificate validation. Deploy a certificate "
+        "whose SAN contains the tested FQDN."
+    ),
+    "UNTRUSTED_CERTIFICATE": (
+        "The test continued without certificate validation. Repair the trust chain "
+        "or use the organisation's approved private CA."
+    ),
+    "TLS_VERIFICATION_DISABLED": (
+        "Rerun without --insecure to record the real certificate validation state."
+    ),
+    "TLS_HANDSHAKE_FAILED": (
+        "No HTTP assessment was possible. Check TLS protocol/cipher compatibility, "
+        "SNI handling and server logs."
+    ),
+    "TLS_CONNECTION_FAILED": (
+        "Check HTTPS reachability, listener state, firewall policy and server logs."
+    ),
+    "HTTPS_TO_HTTP_DOWNGRADE": (
+        "Remove the HTTPS-to-HTTP downgrade and keep the complete request path encrypted."
+    ),
+    "PLAINTEXT_HTTP": "Enable HTTPS and redirect HTTP to HTTPS on the same hostname.",
+    "MIXED": (
+        "TLS state differs across resolved endpoints; remediate each endpoint and "
+        "repeat the complete per-IP assessment."
+    ),
+}
+
 
 class Colors:
     RED = "\033[91m"
@@ -100,6 +177,8 @@ class HTTPResult:
     bytes_sent: int = 0
     error: Optional[str] = None
     final_url: Optional[str] = None
+    redirect_chain: List[str] = field(default_factory=list)
+    blocked_redirect: Optional[str] = None
 
     @property
     def powered_by(self) -> str:
@@ -175,6 +254,13 @@ def normalize_url(raw_url: str) -> str:
     if not path or path == "/":
         path = DEFAULT_PATH
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def canonical_hostname(target_url: str) -> Optional[str]:
+    hostname = urlsplit(target_url).hostname
+    if hostname is None:
+        return None
+    return hostname.rstrip(".").encode("idna").decode("ascii").lower()
 
 
 def resolve_dns_addresses(target_url: str) -> Tuple[List[str], List[str]]:
@@ -626,6 +712,7 @@ def send_post(
     result = HTTPResult()
     current_url = target_url
     current_connect_ip = connect_ip
+    scope_hostname = canonical_hostname(target_url)
     for redirects in range(11 if follow_redirects else 1):
         result.bytes_sent += len(body)
         try:
@@ -678,6 +765,10 @@ def send_post(
         if new.scheme not in ("http", "https") or not new.hostname:
             result.error = f"redirect to unsupported URL: {location}"
             break
+        result.redirect_chain.append(next_url)
+        if canonical_hostname(next_url) != scope_hostname:
+            result.blocked_redirect = next_url
+            break
         if (old.scheme.lower(), old.netloc.lower()) != (
             new.scheme.lower(),
             new.netloc.lower(),
@@ -685,7 +776,6 @@ def send_post(
             for name in list(headers):
                 if name.lower() in SENSITIVE_HEADERS or name.lower() == "host":
                     del headers[name]
-            current_connect_ip = None
         current_url = next_url
     result.final_url = current_url
     return result
@@ -704,6 +794,19 @@ def version_verdict(powered_by: str) -> Optional[str]:
             return "LEGACY"
         return None
     return "FIXED" if patch >= fixed_patch else "VULNERABLE"
+
+
+def classify_tls_error(error: str) -> str:
+    lowered = error.lower()
+    if "certificate verify failed" in lowered:
+        if "self-signed" in lowered:
+            return "SELF_SIGNED_CERTIFICATE"
+        if "expired" in lowered:
+            return "EXPIRED_CERTIFICATE"
+        if "hostname mismatch" in lowered or "not valid for" in lowered:
+            return "HOSTNAME_MISMATCH"
+        return "UNTRUSTED_CERTIFICATE"
+    return "TLS_HANDSHAKE_FAILED"
 
 
 def crash_signal(
@@ -830,6 +933,13 @@ def base_result(host: str) -> dict:
         "confidence": None,
         "needs_verification": True,
         "endpoint_results": [],
+        "tls_status": None,
+        "tls_error": None,
+        "tls_tested_insecurely": False,
+        "tls_status_counts": {},
+        "redirect_chain": [],
+        "redirect_blocked": None,
+        "guidelines": [],
         "vulnerable": None,
         "verdict": "ERROR",
         "status_code": None,
@@ -847,6 +957,18 @@ def base_result(host: str) -> dict:
     }
 
 
+def attach_guidelines(result: dict) -> dict:
+    guidelines: List[str] = []
+    verdict_guidance = VERDICT_GUIDANCE.get(result.get("verdict"))
+    if verdict_guidance:
+        guidelines.append(verdict_guidance)
+    tls_guidance = TLS_GUIDANCE.get(result.get("tls_status"))
+    if tls_guidance and tls_guidance not in guidelines:
+        guidelines.append(tls_guidance)
+    result["guidelines"] = guidelines
+    return result
+
+
 def apply_response(
     result: dict, response: HTTPResult, include_response_body: bool = False
 ) -> None:
@@ -861,8 +983,71 @@ def response_metadata(response: HTTPResult) -> dict:
         "bytes_sent": response.bytes_sent,
         "error": response.error,
         "final_url": response.final_url,
+        "redirect_chain": response.redirect_chain,
+        "redirect_blocked": response.blocked_redirect,
         "description": describe_response(response),
     }
+
+
+def send_control_with_tls_policy(
+    target_url: str,
+    custom_headers: Dict[str, str],
+    timeout: int,
+    verify_ssl: bool,
+    follow_redirects: bool,
+    connect_ip: Optional[str],
+) -> Tuple[HTTPResult, str, Optional[str], bool, bool]:
+    """Send a small control request and retry certificate failures safely.
+
+    Returns the response, TLS status, TLS error, whether an insecure retry was
+    used, and whether subsequent requests should verify TLS.
+    """
+    control = send_post(
+        target_url,
+        CONTROL_BODY,
+        CONTROL_BOUNDARY,
+        custom_headers,
+        timeout,
+        verify_ssl,
+        follow_redirects,
+        connect_ip=connect_ip,
+    )
+    final_url = control.final_url or target_url
+    initial_scheme = urlsplit(target_url).scheme.lower()
+    final_scheme = urlsplit(final_url).scheme.lower()
+
+    if not verify_ssl:
+        status = (
+            "TLS_VERIFICATION_DISABLED"
+            if final_scheme == "https"
+            else "PLAINTEXT_HTTP"
+        )
+        return control, status, None, final_scheme == "https", False
+
+    if control.error and control.error.startswith("SSL error:"):
+        original_error = control.error
+        status = classify_tls_error(original_error)
+        control = send_post(
+            target_url,
+            CONTROL_BODY,
+            CONTROL_BOUNDARY,
+            custom_headers,
+            timeout,
+            False,
+            follow_redirects,
+            connect_ip=connect_ip,
+        )
+        if control.error and control.error.startswith("SSL error:"):
+            return control, "TLS_HANDSHAKE_FAILED", original_error, True, False
+        return control, status, original_error, True, False
+
+    if initial_scheme == "https" and final_scheme == "http":
+        return control, "HTTPS_TO_HTTP_DOWNGRADE", None, False, True
+    if final_scheme == "https":
+        if control.error:
+            return control, "TLS_CONNECTION_FAILED", control.error, False, True
+        return control, "TLS_VALID", None, False, True
+    return control, "PLAINTEXT_HTTP", None, False, True
 
 
 def check_url(
@@ -872,7 +1057,7 @@ def check_url(
     verify_ssl: bool,
     custom_headers: Dict[str, str],
     sapi: str,
-    follow_redirects: bool = False,
+    follow_redirects: bool = True,
     active: bool = False,
     connect_ip: Optional[str] = None,
     include_response_body: bool = False,
@@ -884,16 +1069,25 @@ def check_url(
     result["connect_ip"] = connect_ip
 
     control_headers = request_headers(custom_headers, CONTROL_BOUNDARY)
-    control = send_post(
+    (
+        control,
+        tls_status,
+        tls_error,
+        tls_tested_insecurely,
+        effective_verify_ssl,
+    ) = send_control_with_tls_policy(
         target_url,
-        CONTROL_BODY,
-        CONTROL_BOUNDARY,
         custom_headers,
         timeout,
         verify_ssl,
         follow_redirects,
-        connect_ip=connect_ip,
+        connect_ip,
     )
+    result["tls_status"] = tls_status
+    result["tls_error"] = tls_error
+    result["tls_tested_insecurely"] = tls_tested_insecurely
+    result["redirect_chain"] = control.redirect_chain
+    result["redirect_blocked"] = control.blocked_redirect
     result["request"] = request_dump(
         target_url,
         control_headers,
@@ -902,15 +1096,14 @@ def check_url(
     )
     apply_response(result, control, include_response_body)
     result["control"] = response_metadata(control)
+    if control.blocked_redirect:
+        result["verdict"] = "REDIRECT_OUT_OF_SCOPE"
+        result["reason"] = (
+            "redirect stopped before leaving the authorised hostname: "
+            + control.blocked_redirect
+        )
+        return result
     if control.final_url:
-        original = urlsplit(target_url)
-        final = urlsplit(control.final_url)
-        if (original.scheme.lower(), original.netloc.lower()) != (
-            final.scheme.lower(),
-            final.netloc.lower(),
-        ):
-            connect_ip = None
-            result["connect_ip"] = None
         target_url = control.final_url
         result["final_url"] = target_url
 
@@ -933,7 +1126,7 @@ def check_url(
             CONTROL_BOUNDARY,
             custom_headers,
             timeout,
-            verify_ssl,
+            effective_verify_ssl,
             follow_redirects,
             connect_ip=connect_ip,
         )
@@ -945,6 +1138,15 @@ def check_url(
         )
         apply_response(result, control, include_response_body)
         result["control"] = response_metadata(control)
+        result["redirect_chain"].extend(control.redirect_chain)
+        if control.blocked_redirect:
+            result["redirect_blocked"] = control.blocked_redirect
+            result["verdict"] = "REDIRECT_OUT_OF_SCOPE"
+            result["reason"] = (
+                "phpMyAdmin redirect stopped before leaving the authorised hostname: "
+                + control.blocked_redirect
+            )
+            return result
         if control.final_url:
             target_url = control.final_url
             result["final_url"] = target_url
@@ -1009,8 +1211,8 @@ def check_url(
             PROBE_BOUNDARY,
             custom_headers,
             timeout,
-            verify_ssl,
-            follow_redirects,
+            effective_verify_ssl,
+            False,
             connect_ip=connect_ip,
         )
         probe_metadata = response_metadata(probe)
@@ -1037,6 +1239,16 @@ def check_url(
             result["reason"] = result["error"]
             return result
 
+        probe_location = header_value(probe.headers, "Location").strip()
+        if probe.status_code in (301, 302, 303, 307, 308) and probe_location:
+            result["verdict"] = "REDIRECT_DURING_PROBE"
+            result["redirect_blocked"] = urljoin(target_url, probe_location)
+            result["reason"] = (
+                "the active endpoint redirected the memory-pressure probe; the "
+                "probe was not replayed and the final path must be assessed explicitly"
+            )
+            return result
+
         if probe.status_code in REJECTED_STATUSES:
             rejected = True
             rejected_reason = (
@@ -1053,7 +1265,7 @@ def check_url(
                 CONTROL_BOUNDARY,
                 custom_headers,
                 timeout,
-                verify_ssl,
+                effective_verify_ssl,
                 follow_redirects,
                 connect_ip=connect_ip,
             )
@@ -1062,6 +1274,7 @@ def check_url(
             result["sapi"] = detected_sapi
             confirmation_ok = (
                 confirmation.error is None
+                and confirmation.blocked_redirect is None
                 and confirmation.status_code is not None
                 and confirmation.status_code < 500
             )
@@ -1154,7 +1367,7 @@ def check_vulnerability(
     custom_headers: Optional[Dict[str, str]] = None,
     sapi: str = "auto",
     paths: Optional[List[str]] = None,
-    follow_redirects: bool = False,
+    follow_redirects: bool = True,
     active: bool = False,
     scan_each_ip: bool = False,
     include_response_body: bool = False,
@@ -1166,7 +1379,7 @@ def check_vulnerability(
         result = base_result(display_host)
         result["error"] = str(exc)
         result["reason"] = str(exc)
-        return result
+        return attach_guidelines(result)
 
     dns_addresses, public_ips = resolve_dns_addresses(normalized)
     targets = (
@@ -1179,7 +1392,7 @@ def check_vulnerability(
         result["reason"] = result["error"]
         result["dns_addresses"] = dns_addresses
         result["public_ips"] = public_ips
-        return result
+        return attach_guidelines(result)
 
     connect_ips: List[Optional[str]] = (
         list(dns_addresses) if scan_each_ip else [None]
@@ -1192,6 +1405,8 @@ def check_vulnerability(
         "PARTIAL_MULTI_IP_COVERAGE": 3,
         "ERROR": 3,
         "SUSPICIOUS_SIGNAL": 4,
+        "REDIRECT_OUT_OF_SCOPE": 4,
+        "REDIRECT_DURING_PROBE": 4,
         "AT_RISK_VERSION": 4,
         "LEGACY_VERSION_REVIEW": 4,
         "LIKELY_VULNERABLE": 5,
@@ -1210,6 +1425,7 @@ def check_vulnerability(
                 connect_ip=connect_ip,
                 include_response_body=include_response_body,
             )
+            attach_guidelines(endpoint)
             endpoint_results.append(endpoint)
             if fallback is None or fallback_priority.get(
                 endpoint["verdict"], 0
@@ -1225,6 +1441,13 @@ def check_vulnerability(
     result["public_ips"] = public_ips
     result["multiple_public_ips"] = len(public_ips) > 1
     result["multiple_addresses"] = len(dns_addresses) > 1
+    tls_status_counts: Dict[str, int] = {}
+    for endpoint in endpoint_results:
+        status = endpoint.get("tls_status") or "UNKNOWN"
+        tls_status_counts[status] = tls_status_counts.get(status, 0) + 1
+    result["tls_status_counts"] = tls_status_counts
+    if len(tls_status_counts) > 1:
+        result["tls_status"] = "MIXED"
     if len(dns_addresses) > 1 and not scan_each_ip and result["vulnerable"] is False:
         result["vulnerable"] = None
         result["verdict"] = "PARTIAL_MULTI_IP_COVERAGE"
@@ -1233,7 +1456,7 @@ def check_vulnerability(
             "the hostname resolves to multiple addresses but only the resolver-selected "
             "node was tested; rerun with --scan-each-ip before treating it as patched"
         )
-    return result
+    return attach_guidelines(result)
 
 
 def load_lines(path: str, label: str) -> List[str]:
@@ -1307,6 +1530,8 @@ def print_result(result: dict, verbose: bool = False) -> None:
         "AT_RISK_VERSION",
         "LEGACY_VERSION_REVIEW",
         "SUSPICIOUS_SIGNAL",
+        "REDIRECT_OUT_OF_SCOPE",
+        "REDIRECT_DURING_PROBE",
     }:
         status = colorize("[REVIEW REQUIRED]", Colors.YELLOW + Colors.BOLD)
     elif verdict in {"INCONCLUSIVE", "PARTIAL_MULTI_IP_COVERAGE"}:
@@ -1324,6 +1549,14 @@ def print_result(result: dict, verbose: bool = False) -> None:
     suffix = " - " + " - ".join(details) if details else ""
     print(f"{status} {colorize(terminal_safe(host), Colors.WHITE)}{suffix}")
 
+    if result.get("tls_status"):
+        tls_suffix = " (test continued without certificate validation)" if result.get(
+            "tls_tested_insecurely"
+        ) else ""
+        print(f"  -> TLS: {result['tls_status']}{tls_suffix}")
+    if result.get("tls_error") and verbose:
+        print(f"  -> TLS detail: {terminal_safe(result['tls_error'])}")
+
     if result.get("multiple_addresses"):
         addresses = ", ".join(result["dns_addresses"])
         print(f"  -> DNS resolved to multiple addresses: {addresses}")
@@ -1331,6 +1564,10 @@ def print_result(result: dict, verbose: bool = False) -> None:
         print(f"  -> Connected directly to: {result['connect_ip']}")
     if result.get("final_url") and result.get("final_url") != result.get("tested_url"):
         print(f"  -> Retargeted to: {terminal_safe(result['final_url'])}")
+    if result.get("redirect_blocked"):
+        print(f"  -> Redirect blocked: {terminal_safe(result['redirect_blocked'])}")
+    for guideline in result.get("guidelines", []):
+        print(f"  -> Guidance: {terminal_safe(guideline)}")
     if verbose and result.get("reason"):
         print(f"  -> {terminal_safe(result['reason'])}")
     if verbose and result.get("response"):
@@ -1343,7 +1580,7 @@ def print_result(result: dict, verbose: bool = False) -> None:
             endpoint_label = endpoint.get("connect_ip") or "system DNS"
             print(
                 f"    {endpoint_label} {endpoint.get('tested_url')}: "
-                f"{endpoint.get('verdict')}"
+                f"{endpoint.get('verdict')} / TLS {endpoint.get('tls_status')}"
             )
 
 
@@ -1403,13 +1640,22 @@ Examples:
         "-k",
         "--insecure",
         action="store_true",
-        help="Disable TLS certificate verification",
+        help="Skip the initial TLS verification attempt (not recommended)",
     )
-    parser.add_argument(
+    redirect_group = parser.add_mutually_exclusive_group()
+    redirect_group.add_argument(
         "--follow-redirects",
+        dest="follow_redirects",
         action="store_true",
-        help="Follow HTTP redirects during assessment (up to 10 hops)",
+        help=argparse.SUPPRESS,
     )
+    redirect_group.add_argument(
+        "--no-follow-redirects",
+        dest="follow_redirects",
+        action="store_false",
+        help="Do not follow redirects (same-host redirects are followed by default)",
+    )
+    parser.set_defaults(follow_redirects=True)
     parser.add_argument(
         "-H",
         "--header",
@@ -1493,6 +1739,14 @@ def main() -> None:
         print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
         print(
             colorize(
+                "[*] Redirects: same hostname only (enabled by default)"
+                if args.follow_redirects
+                else "[*] Redirects: disabled",
+                Colors.CYAN,
+            )
+        )
+        print(
+            colorize(
                 "[*] Mode: active memory-pressure probes"
                 if args.active
                 else "[*] Mode: low-impact discovery request only",
@@ -1508,7 +1762,6 @@ def main() -> None:
     verify_ssl = not args.insecure
     results: List[dict] = []
     vulnerable_count = 0
-    error_count = 0
 
     def scan(host: str) -> dict:
         try:
@@ -1528,7 +1781,7 @@ def main() -> None:
             result = base_result(safe_url_label(host))
             result["error"] = f"unexpected error: {exc}"
             result["reason"] = result["error"]
-            return result
+            return attach_guidelines(result)
 
     if args.active and len(hosts) > 1:
         for probe in PROBES:
@@ -1553,10 +1806,7 @@ def main() -> None:
                     result = future.result()
                     results.append(result)
 
-                    should_print = result["vulnerable"] is not False or (
-                        not args.quiet
-                        and (args.verbose or result["multiple_public_ips"])
-                    )
+                    should_print = result["vulnerable"] is not False or not args.quiet
                     if should_print:
                         if args.quiet:
                             print_result(result, args.verbose)
@@ -1568,6 +1818,12 @@ def main() -> None:
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
     attention_count = sum(result["vulnerable"] is None for result in results)
     patched_count = sum(result["vulnerable"] is False for result in results)
+    tls_summary: Dict[str, int] = {}
+    for result in results:
+        endpoints = result.get("endpoint_results") or [result]
+        for endpoint in endpoints:
+            tls_status = endpoint.get("tls_status") or "UNKNOWN"
+            tls_summary[tls_status] = tls_summary.get(tls_status, 0) + 1
     if not args.quiet:
         print()
         print(colorize("=" * 60, Colors.CYAN))
@@ -1580,6 +1836,9 @@ def main() -> None:
         print(f"  {vulnerable_label}")
         print(f"  Patched version advertised: {patched_count}")
         print(f"  Review/inconclusive/errors: {attention_count}")
+        print("  TLS endpoint states:")
+        for tls_status, count in sorted(tls_summary.items()):
+            print(f"    {tls_status}: {count}")
         print(colorize("=" * 60, Colors.CYAN))
 
     output_saved = True
